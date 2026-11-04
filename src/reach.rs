@@ -7,9 +7,11 @@
 //! It is derived and rebuildable: never authoritative, never persisted. The
 //! authority is the folder documents themselves plus `doc_creators`.
 //!
-//! **Admission rule.** A document joins a vault's set only if the vault's owner
-//! created it. Without that, a member could reach someone else's document by
-//! writing its URL into their own folder.
+//! **Admission rule.** A document joins a vault's set only if the vault's
+//! holder admits its creator ([`Holder::admits`]): for a member's vault, the
+//! member created it; for a workspace's, someone in the workspace did. Without
+//! that, a member could reach someone else's document by writing its URL into
+//! their own folder.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -23,8 +25,7 @@ use samod::{AutomergeUrl, DocHandle, DocumentId};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::auth::Did;
-use crate::authz::Authz;
+use crate::authz::{Authz, Holder};
 
 /// The shortest gap between two rebuilds of one vault. A first import changes
 /// folder documents thousands of times.
@@ -52,7 +53,7 @@ pub(crate) struct Index {
 }
 
 struct VaultReach {
-    owner: Did,
+    holder: Holder,
     docs: HashSet<DocumentId>,
     /// Linked from a folder, creator not yet known. A folder change can arrive
     /// before the linked note's first frame.
@@ -72,9 +73,10 @@ struct VaultReach {
 }
 
 impl Index {
-    pub(crate) fn owner_of(&self, doc: &DocumentId) -> Option<&Did> {
+    /// Who holds the vault a document is in, if any.
+    pub(crate) fn holder_of(&self, doc: &DocumentId) -> Option<&Holder> {
         let root = self.doc_to_root.get(doc)?;
-        self.vaults.get(root).map(|vault| &vault.owner)
+        self.vaults.get(root).map(|vault| &vault.holder)
     }
 
     /// The root of the vault a document is in, if any.
@@ -119,7 +121,12 @@ pub(crate) struct Entry {
 
 impl Entry {
     pub(crate) fn doc_id(&self) -> Option<DocumentId> {
-        Some(AutomergeUrl::from_str(&self.url).ok()?.document_id().clone())
+        Some(
+            AutomergeUrl::from_str(&self.url)
+                .ok()?
+                .document_id()
+                .clone(),
+        )
     }
 }
 
@@ -200,7 +207,7 @@ impl Authz {
     pub(crate) fn start_vault(
         &self,
         root: DocumentId,
-        owner: Did,
+        holder: Holder,
         last_change: Option<DateTime<Utc>>,
     ) {
         let wake = Arc::new(Notify::new());
@@ -211,7 +218,7 @@ impl Authz {
             index.vaults.insert(
                 root.clone(),
                 VaultReach {
-                    owner,
+                    holder,
                     docs: HashSet::from([root.clone()]),
                     pending: HashSet::new(),
                     wake: Arc::clone(&wake),
@@ -244,14 +251,14 @@ impl Authz {
 
     /// Walk the vault's folders from its root and replace its reachable set.
     async fn rebuild(&self, root: &DocumentId) {
-        let Some((owner, wake)) = self
+        let Some((holder, wake)) = self
             .0
             .reach
             .read()
             .unwrap()
             .vaults
             .get(root)
-            .map(|vault| (vault.owner.clone(), Arc::clone(&vault.wake)))
+            .map(|vault| (vault.holder.clone(), Arc::clone(&vault.wake)))
         else {
             return;
         };
@@ -287,8 +294,8 @@ impl Authz {
                 if docs.contains(&id) || pending.contains(&id) {
                     continue;
                 }
-                match self.creator_of(&id) {
-                    Some(creator) if creator == owner => {
+                match self.creator(&id) {
+                    Some(creator) if holder.admits(&creator) => {
                         docs.insert(id.clone());
                         if entry.kind == FOLDER {
                             folders.push(id);
@@ -297,8 +304,8 @@ impl Authz {
                         }
                     }
                     Some(creator) => tracing::warn!(
-                        vault = %root, doc = %id, %owner, %creator,
-                        "ignoring a link to a document its vault's owner did not create"
+                        vault = %root, doc = %id, %holder, creator = %creator.did,
+                        "ignoring a link to a document its vault does not admit"
                     ),
                     None => {
                         pending.insert(id);

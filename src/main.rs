@@ -112,7 +112,10 @@ async fn main() -> Result<()> {
             .map(|auth| auth.sync_audience.as_str())
             .unwrap_or_default()
             .into(),
-        oidc_issuer: config.auth.as_ref().map(|auth| auth.oidc_issuer.as_str().into()),
+        oidc_issuer: config
+            .auth
+            .as_ref()
+            .map(|auth| auth.oidc_issuer.as_str().into()),
         authz: authz.clone(),
         enforce: config.require_auth,
         service_token: config.service_token.as_deref().map(Arc::from),
@@ -196,7 +199,10 @@ async fn build_verifier(config: &Config) -> Result<Arc<dyn DidVerifier>> {
 /// in; it deliberately does not touch Postgres, so a database blip cannot get
 /// the relay restarted out from under live connections.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, format!("ok auth={}\n", state.verifier.name()))
+    (
+        StatusCode::OK,
+        format!("ok auth={}\n", state.verifier.name()),
+    )
 }
 
 /// RFC 9728 protected resource metadata for the sync resource: which
@@ -251,9 +257,9 @@ async fn sync(
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState, verified: Verified) {
-    let did = verified.did;
+    let did = verified.caller.did.clone();
     if state.enforce {
-        let filter = filter::Filter::new(state.authz, did);
+        let filter = filter::Filter::new(state.authz, verified.caller);
         filter::run(socket, &state.acceptor, filter, verified.expires_at).await;
         return;
     }
@@ -445,8 +451,8 @@ mod tests {
         assert!(vault["last_change_at"].is_null());
 
         let root = vault["root_doc_id"].as_str().unwrap().parse().unwrap();
-        assert!(authz.may_open(&auth::Did(ALICE.into()), &root));
-        assert!(!authz.may_open(&auth::Did(BOB.into()), &root));
+        assert!(authz.opens(&auth::Did(ALICE.into()), &root));
+        assert!(!authz.opens(&auth::Did(BOB.into()), &root));
     }
 
     #[sqlx::test(migrations = false)]
@@ -495,6 +501,58 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn a_workspace_vault_lists_for_whoever_the_token_puts_in_it(pool: PgPool) {
+        let (base, _) = relay(&pool).await;
+        let client = reqwest::Client::new();
+        let create = |body: Value| {
+            client
+                .post(format!("{base}/internal/vaults"))
+                .bearer_auth(SERVICE_TOKEN)
+                .json(&body)
+                .send()
+        };
+
+        let response = create(json!({ "did": ALICE, "name": "Garden", "workspace": "7" }))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let vault: Value = response.json().await.unwrap();
+        assert_eq!(vault["workspace"], "7");
+
+        let response = create(json!({ "did": BOB, "name": "Other", "workspace": "7" }))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "workspace_has_vault");
+
+        let response = create(json!({ "did": BOB, "name": "Bad", "workspace": "a/b" }))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        create_vault(&base, BOB, "Private").await;
+        let bob_in_7 = TokenSpec::default()
+            .claim("sub", json!(BOB))
+            .claim("workspaces", json!([{ "id": "7", "name": "Garden Club" }]))
+            .sign();
+        // The token's name for the workspace, not the one it was created with.
+        let own = client.get(format!("{base}/vaults")).bearer_auth(bob_in_7);
+        assert_eq!(names(own).await, ["Garden Club", "Private"]);
+
+        // Alice made it, and a token naming no workspace still does not list it.
+        let alice = client
+            .get(format!("{base}/vaults"))
+            .bearer_auth(member_token(ALICE));
+        assert!(names(alice).await.is_empty());
+
+        let for_bob = client
+            .get(format!("{base}/internal/vaults?did={BOB}&workspaces=7,9"))
+            .bearer_auth(SERVICE_TOKEN);
+        assert_eq!(names(for_bob).await, ["Garden", "Private"]);
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn vault_endpoints_refuse_the_wrong_credential(pool: PgPool) {
         let (base, _) = relay(&pool).await;
         let client = reqwest::Client::new();
@@ -507,7 +565,9 @@ mod tests {
             // The member endpoint: no token, the service credential, a token
             // for another audience.
             client.get(format!("{base}/vaults")),
-            client.get(format!("{base}/vaults")).bearer_auth(SERVICE_TOKEN),
+            client
+                .get(format!("{base}/vaults"))
+                .bearer_auth(SERVICE_TOKEN),
             client.get(format!("{base}/vaults")).bearer_auth(
                 TokenSpec::default()
                     .claim("aud", json!("https://mcp.corliss.test"))
@@ -627,11 +687,9 @@ mod tests {
         let laptop = client(&base, ALICE).await;
         let note = laptop.create(doc_with("title", "plan")).await.unwrap();
         let id = note.document_id().clone();
-        authz::tests::eventually("the relay has the note", || {
-            authz.creator_of(&id).is_some()
-        })
-        .await;
-        assert!(authz.may_open(&auth::Did(ALICE.into()), &id));
+        authz::tests::eventually("the relay has the note", || authz.creator_of(&id).is_some())
+            .await;
+        assert!(authz.opens(&auth::Did(ALICE.into()), &id));
 
         // Her phone gets it from the relay, with the laptop's content.
         let phone = client(&base, ALICE).await;
@@ -663,10 +721,8 @@ mod tests {
         let laptop = client(&base, ALICE).await;
         let note = laptop.create(doc_with("title", "plan")).await.unwrap();
         let id = note.document_id().clone();
-        authz::tests::eventually("the relay has the note", || {
-            authz.creator_of(&id).is_some()
-        })
-        .await;
+        authz::tests::eventually("the relay has the note", || authz.creator_of(&id).is_some())
+            .await;
 
         let phone = client(&base, ALICE).await;
         let on_phone = phone.find(id).await.unwrap().expect("found");
@@ -725,9 +781,19 @@ mod tests {
 
     impl Relay {
         fn mcp_token(&self, did: &str) -> String {
+            self.mcp_token_in(did, &[])
+        }
+
+        /// An MCP token for a member in these workspaces, given as ID and name.
+        fn mcp_token_in(&self, did: &str, workspaces: &[(&str, &str)]) -> String {
+            let workspaces: Vec<Value> = workspaces
+                .iter()
+                .map(|(id, name)| json!({ "id": id, "name": name }))
+                .collect();
             TokenSpec::default()
                 .claim("sub", json!(did))
                 .claim("aud", json!(self.mcp))
+                .claim("workspaces", json!(workspaces))
                 .sign()
         }
 
@@ -746,9 +812,20 @@ mod tests {
         /// Call a tool as a member. Returns whether the tool reported an
         /// error, and the text it answered with.
         async fn call(&self, did: &str, tool: &str, arguments: Value) -> (bool, String) {
+            self.call_in(did, &[], tool, arguments).await
+        }
+
+        /// [`Relay::call`] for a member in these workspaces.
+        async fn call_in(
+            &self,
+            did: &str,
+            workspaces: &[(&str, &str)],
+            tool: &str,
+            arguments: Value,
+        ) -> (bool, String) {
             let response = self
                 .rpc(
-                    Some(&self.mcp_token(did)),
+                    Some(&self.mcp_token_in(did, workspaces)),
                     "tools/call",
                     json!({ "name": tool, "arguments": arguments }),
                 )
@@ -764,7 +841,10 @@ mod tests {
             assert!(result.is_object(), "{tool}: {body}");
             (
                 result["isError"].as_bool().unwrap_or(false),
-                result["content"][0]["text"].as_str().unwrap_or_default().to_string(),
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
             )
         }
 
@@ -809,24 +889,128 @@ mod tests {
             );
         }
 
-        let metadata: Value = reqwest::get(&metadata_url).await.unwrap().json().await.unwrap();
+        let metadata: Value = reqwest::get(&metadata_url)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(metadata["resource"], relay.mcp);
-        assert_eq!(metadata["authorization_servers"], json!([auth::tests::ISSUER]));
+        assert_eq!(
+            metadata["authorization_servers"],
+            json!([auth::tests::ISSUER])
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn mcp_groups_vaults_as_private_and_workspaces(pool: PgPool) {
+        let relay = start(&pool).await;
+        // Created under one name; the token's name for the workspace wins.
+        relay
+            .authz
+            .create_workspace_vault(&auth::Did(ALICE.into()), "7", "Old name")
+            .await
+            .unwrap();
+        relay
+            .authz
+            .create_vault(&auth::Did(BOB.into()), "Notes")
+            .await
+            .unwrap();
+        let in_7 = [("7", "Notes")];
+
+        // Alice writes to the workspace's vault, her only one.
+        let (is_error, text) = relay
+            .call_in(
+                ALICE,
+                &in_7,
+                "create_note",
+                json!({ "path": "plan.md", "content": "dig beds" }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+
+        // Until the index walks the folder, the note is Alice's alone.
+        let alice = auth::Caller::in_workspaces(auth::Did(ALICE.into()), vec!["7".into()]);
+        let mut walked = false;
+        for _ in 0..200 {
+            if relay.authz.list_vaults(&alice).await.unwrap()[0].note_count == Some(1) {
+                walked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(walked, "the note never joined the vault");
+
+        // Bob's vaults, in their two groups.
+        let (is_error, text) = relay.call_in(BOB, &in_7, "list_vaults", json!({})).await;
+        assert!(!is_error, "{text}");
+        let listed: Value = serde_json::from_str(&text).unwrap();
+        let named = |group: &str| -> Vec<String> {
+            listed[group]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|vault| vault["vault"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(named("Private"), ["Private/Notes"]);
+        assert_eq!(named("Workspaces"), ["Workspaces/Notes"]);
+
+        // Both are named Notes, so the bare name is refused.
+        let (is_error, why) = relay
+            .call_in(
+                BOB,
+                &in_7,
+                "read_note",
+                json!({ "vault": "notes", "path": "plan.md" }),
+            )
+            .await;
+        assert!(is_error);
+        assert!(why.contains("Workspaces/notes"), "{why}");
+
+        let (is_error, text) = relay
+            .call_in(
+                BOB,
+                &in_7,
+                "read_note",
+                json!({ "vault": "workspaces/Notes", "path": "plan.md" }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+        assert!(text.contains("dig beds"), "{text}");
+
+        // Without the workspace in his token, there is no such vault.
+        let why = relay
+            .refused(
+                BOB,
+                "read_note",
+                json!({ "vault": "Workspaces/Notes", "path": "plan.md" }),
+            )
+            .await;
+        assert!(why.contains("no vault"), "{why}");
     }
 
     #[sqlx::test(migrations = false)]
     async fn the_sync_listener_names_its_issuer(pool: PgPool) {
         let relay = start(&pool).await;
-        let metadata: Value =
-            reqwest::get(format!("{}/.well-known/oauth-protected-resource", relay.base))
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+        let metadata: Value = reqwest::get(format!(
+            "{}/.well-known/oauth-protected-resource",
+            relay.base
+        ))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
         assert_eq!(metadata["resource"], SYNC_AUDIENCE);
-        assert_eq!(metadata["authorization_servers"], json!([auth::tests::ISSUER]));
-        assert_eq!(metadata["bearer_methods_supported"], json!(["header", "query"]));
+        assert_eq!(
+            metadata["authorization_servers"],
+            json!([auth::tests::ISSUER])
+        );
+        assert_eq!(
+            metadata["bearer_methods_supported"],
+            json!(["header", "query"])
+        );
     }
 
     #[sqlx::test(migrations = false)]
@@ -884,8 +1068,14 @@ mod tests {
         create_vault(&relay.base, ALICE, "Notes").await;
 
         // No initialize was ever sent: every call stands on its own token.
-        assert!(relay.ok(ALICE, "list_vaults", json!({})).await.contains("Notes"));
-        assert_eq!(paths(&relay.ok(ALICE, "list_notes", json!({})).await), [""; 0]);
+        assert!(relay
+            .ok(ALICE, "list_vaults", json!({}))
+            .await
+            .contains("Notes"));
+        assert_eq!(
+            paths(&relay.ok(ALICE, "list_notes", json!({})).await),
+            [""; 0]
+        );
 
         relay
             .ok(
@@ -895,7 +1085,11 @@ mod tests {
             )
             .await;
         relay
-            .ok(ALICE, "create_note", json!({ "path": "inbox.md", "content": "relay relay" }))
+            .ok(
+                ALICE,
+                "create_note",
+                json!({ "path": "inbox.md", "content": "relay relay" }),
+            )
             .await;
 
         assert_eq!(
@@ -903,11 +1097,19 @@ mod tests {
             ["inbox.md", "Projects"]
         );
         assert_eq!(
-            paths(&relay.ok(ALICE, "list_notes", json!({ "recursive": true })).await),
+            paths(
+                &relay
+                    .ok(ALICE, "list_notes", json!({ "recursive": true }))
+                    .await
+            ),
             ["inbox.md", "Projects", "Projects/plan.md"]
         );
         assert_eq!(
-            paths(&relay.ok(ALICE, "list_notes", json!({ "path": "projects" })).await),
+            paths(
+                &relay
+                    .ok(ALICE, "list_notes", json!({ "path": "projects" }))
+                    .await
+            ),
             ["Projects/plan.md"]
         );
 
@@ -921,27 +1123,49 @@ mod tests {
             )
             .await;
         relay
-            .ok(ALICE, "append_note", json!({ "path": "Projects/plan.md", "text": "Then the plugin." }))
+            .ok(
+                ALICE,
+                "append_note",
+                json!({ "path": "Projects/plan.md", "text": "Then the plugin." }),
+            )
             .await;
         relay
-            .ok(ALICE, "append_note", json!({ "path": "inbox.md", "text": "second line" }))
+            .ok(
+                ALICE,
+                "append_note",
+                json!({ "path": "inbox.md", "text": "second line" }),
+            )
             .await;
         assert_eq!(
-            relay.ok(ALICE, "read_note", json!({ "path": "Projects/plan.md" })).await,
+            relay
+                .ok(ALICE, "read_note", json!({ "path": "Projects/plan.md" }))
+                .await,
             "# Plan\nShip the relay 🚀 before Corliss.\nThen the plugin."
         );
         assert_eq!(
-            relay.ok(ALICE, "read_note", json!({ "path": "/inbox.md" })).await,
+            relay
+                .ok(ALICE, "read_note", json!({ "path": "/inbox.md" }))
+                .await,
             "relay relay\nsecond line"
         );
 
         // Best match first, and a note found by a word in its path.
-        let found = relay.ok(ALICE, "search_notes", json!({ "query": "RELAY" })).await;
+        let found = relay
+            .ok(ALICE, "search_notes", json!({ "query": "RELAY" }))
+            .await;
         assert_eq!(paths(&found), ["inbox.md", "Projects/plan.md"]);
         assert!(found.contains("Ship the relay"));
-        let found = relay.ok(ALICE, "search_notes", json!({ "query": "projects plugin" })).await;
+        let found = relay
+            .ok(ALICE, "search_notes", json!({ "query": "projects plugin" }))
+            .await;
         assert_eq!(paths(&found), ["Projects/plan.md"]);
-        let found = relay.ok(ALICE, "search_notes", json!({ "query": "nothing-says-this" })).await;
+        let found = relay
+            .ok(
+                ALICE,
+                "search_notes",
+                json!({ "query": "nothing-says-this" }),
+            )
+            .await;
         assert!(paths(&found).is_empty());
     }
 
@@ -950,23 +1174,39 @@ mod tests {
         let relay = start(&pool).await;
         create_vault(&relay.base, ALICE, "Notes").await;
         relay
-            .ok(ALICE, "create_note", json!({ "path": "a.md", "content": "one two one" }))
+            .ok(
+                ALICE,
+                "create_note",
+                json!({ "path": "a.md", "content": "one two one" }),
+            )
             .await;
 
         for (tool, arguments) in [
             // Already there, in any letter case.
             ("create_note", json!({ "path": "A.md", "content": "" })),
             ("create_note", json!({ "path": "notes.txt", "content": "" })),
-            ("create_note", json!({ "path": ".hidden/a.md", "content": "" })),
+            (
+                "create_note",
+                json!({ "path": ".hidden/a.md", "content": "" }),
+            ),
             ("create_note", json!({ "path": "../a.md", "content": "" })),
             // A note is not a folder.
             ("create_note", json!({ "path": "a.md/b.md", "content": "" })),
             ("read_note", json!({ "path": "missing.md" })),
             ("list_notes", json!({ "path": "missing" })),
-            ("edit_note", json!({ "path": "a.md", "old_text": "three", "new_text": "3" })),
+            (
+                "edit_note",
+                json!({ "path": "a.md", "old_text": "three", "new_text": "3" }),
+            ),
             // Two matches and no replace_all.
-            ("edit_note", json!({ "path": "a.md", "old_text": "one", "new_text": "1" })),
-            ("edit_note", json!({ "path": "a.md", "old_text": "", "new_text": "x" })),
+            (
+                "edit_note",
+                json!({ "path": "a.md", "old_text": "one", "new_text": "1" }),
+            ),
+            (
+                "edit_note",
+                json!({ "path": "a.md", "old_text": "", "new_text": "x" }),
+            ),
             ("append_note", json!({ "path": "missing.md", "text": "x" })),
             ("read_note", json!({ "vault": "Other", "path": "a.md" })),
             ("search_notes", json!({ "query": "  " })),
@@ -974,7 +1214,12 @@ mod tests {
             relay.refused(ALICE, tool, arguments).await;
         }
         // None of that changed the note.
-        assert_eq!(relay.ok(ALICE, "read_note", json!({ "path": "a.md" })).await, "one two one");
+        assert_eq!(
+            relay
+                .ok(ALICE, "read_note", json!({ "path": "a.md" }))
+                .await,
+            "one two one"
+        );
 
         relay
             .ok(
@@ -983,13 +1228,26 @@ mod tests {
                 json!({ "path": "a.md", "old_text": "one", "new_text": "1", "replace_all": true }),
             )
             .await;
-        assert_eq!(relay.ok(ALICE, "read_note", json!({ "path": "a.md" })).await, "1 two 1");
+        assert_eq!(
+            relay
+                .ok(ALICE, "read_note", json!({ "path": "a.md" }))
+                .await,
+            "1 two 1"
+        );
 
         // With a second vault, the vault has to be named.
         create_vault(&relay.base, ALICE, "Work").await;
-        let why = relay.refused(ALICE, "read_note", json!({ "path": "a.md" })).await;
+        let why = relay
+            .refused(ALICE, "read_note", json!({ "path": "a.md" }))
+            .await;
         assert!(why.contains("Notes") && why.contains("Work"), "{why}");
-        relay.ok(ALICE, "read_note", json!({ "vault": "notes", "path": "a.md" })).await;
+        relay
+            .ok(
+                ALICE,
+                "read_note",
+                json!({ "vault": "notes", "path": "a.md" }),
+            )
+            .await;
     }
 
     #[sqlx::test(migrations = false)]
@@ -998,18 +1256,38 @@ mod tests {
         create_vault(&relay.base, ALICE, "Notes").await;
         let (_, bobs) = create_vault(&relay.base, BOB, "Notes").await;
         relay
-            .ok(ALICE, "create_note", json!({ "path": "secret.md", "content": "alice only" }))
+            .ok(
+                ALICE,
+                "create_note",
+                json!({ "path": "secret.md", "content": "alice only" }),
+            )
             .await;
 
         // Same vault name, his own vault: hers is not in it.
-        assert!(paths(&relay.ok(BOB, "list_notes", json!({ "recursive": true })).await).is_empty());
-        relay.refused(BOB, "read_note", json!({ "path": "secret.md" })).await;
-        assert!(paths(&relay.ok(BOB, "search_notes", json!({ "query": "alice" })).await).is_empty());
+        assert!(paths(
+            &relay
+                .ok(BOB, "list_notes", json!({ "recursive": true }))
+                .await
+        )
+        .is_empty());
+        relay
+            .refused(BOB, "read_note", json!({ "path": "secret.md" }))
+            .await;
+        assert!(paths(
+            &relay
+                .ok(BOB, "search_notes", json!({ "query": "alice" }))
+                .await
+        )
+        .is_empty());
 
         // Bob writes a link to her note into his own root folder.
         let alice = auth::Did(ALICE.into());
         let notes = mcp::tests::notes_of(&relay.authz, &alice).await;
-        let secret = notes.into_iter().find(|(path, _)| path == "secret.md").unwrap().1;
+        let secret = notes
+            .into_iter()
+            .find(|(path, _)| path == "secret.md")
+            .unwrap()
+            .1;
         let bobs_root: samod::DocumentId = bobs["root_doc_id"].as_str().unwrap().parse().unwrap();
         let entry = reach::Entry {
             name: "stolen.md".to_string(),
@@ -1028,13 +1306,26 @@ mod tests {
             .unwrap();
 
         assert!(paths(&relay.ok(BOB, "list_notes", json!({})).await).is_empty());
-        relay.refused(BOB, "read_note", json!({ "path": "stolen.md" })).await;
         relay
-            .refused(BOB, "append_note", json!({ "path": "stolen.md", "text": "mine now" }))
+            .refused(BOB, "read_note", json!({ "path": "stolen.md" }))
             .await;
-        assert!(paths(&relay.ok(BOB, "search_notes", json!({ "query": "alice" })).await).is_empty());
+        relay
+            .refused(
+                BOB,
+                "append_note",
+                json!({ "path": "stolen.md", "text": "mine now" }),
+            )
+            .await;
+        assert!(paths(
+            &relay
+                .ok(BOB, "search_notes", json!({ "query": "alice" }))
+                .await
+        )
+        .is_empty());
         assert_eq!(
-            relay.ok(ALICE, "read_note", json!({ "path": "secret.md" })).await,
+            relay
+                .ok(ALICE, "read_note", json!({ "path": "secret.md" }))
+                .await,
             "alice only"
         );
     }
@@ -1053,7 +1344,11 @@ mod tests {
         let folder = device.find(root).await.unwrap().expect("the vault root");
 
         relay
-            .ok(ALICE, "create_note", json!({ "path": "today.md", "content": "from Claude" }))
+            .ok(
+                ALICE,
+                "create_note",
+                json!({ "path": "today.md", "content": "from Claude" }),
+            )
             .await;
 
         // The new entry arrives in the folder she already has...
@@ -1069,7 +1364,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(entries.len(), 1, "the entry never reached the device");
-        assert_eq!((entries[0].name.as_str(), entries[0].kind.as_str()), ("today.md", "md"));
+        assert_eq!(
+            (entries[0].name.as_str(), entries[0].kind.as_str()),
+            ("today.md", "md")
+        );
 
         // ...and the note it points at can be fetched, as the plugin would.
         let note_id = entries[0].doc_id().unwrap();
@@ -1085,14 +1383,17 @@ mod tests {
             let (_, content) = doc.get(automerge::ROOT, "content").unwrap().unwrap();
             let end = doc.length(&content);
             let mut tx = doc.transaction();
-            tx.splice_text(&content, end, 0, ", and from the phone").unwrap();
+            tx.splice_text(&content, end, 0, ", and from the phone")
+                .unwrap();
             tx.commit();
         })
         .await
         .unwrap();
 
         for _ in 0..100 {
-            let text = relay.ok(ALICE, "read_note", json!({ "path": "today.md" })).await;
+            let text = relay
+                .ok(ALICE, "read_note", json!({ "path": "today.md" }))
+                .await;
             if text == "from Claude, and from the phone" {
                 return;
             }

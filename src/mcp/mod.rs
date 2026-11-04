@@ -107,7 +107,7 @@ async fn metadata(State(state): State<McpState>) -> impl IntoResponse {
     }))
 }
 
-/// Verify the bearer token and leave the member's DID where tools find it.
+/// Verify the bearer token and leave the caller where tools find them.
 async fn authenticate(State(state): State<McpState>, mut request: Request, next: Next) -> Response {
     let token = request
         .headers()
@@ -117,9 +117,13 @@ async fn authenticate(State(state): State<McpState>, mut request: Request, next:
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
         .map(|(_, token)| token.trim().to_string());
 
-    match state.verifier.verify(token.as_deref(), &state.audience).await {
+    match state
+        .verifier
+        .verify(token.as_deref(), &state.audience)
+        .await
+    {
         Ok(verified) => {
-            request.extensions_mut().insert(verified.did);
+            request.extensions_mut().insert(verified.caller);
             next.run(request).await
         }
         Err(e) => {
@@ -127,7 +131,9 @@ async fn authenticate(State(state): State<McpState>, mut request: Request, next:
             let challenge = format!("Bearer resource_metadata=\"{}\"", state.metadata_url);
             let mut response = (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
             if let Ok(value) = HeaderValue::from_str(&challenge) {
-                response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, value);
             }
             response
         }
@@ -138,12 +144,16 @@ async fn authenticate(State(state): State<McpState>, mut request: Request, next:
 pub(crate) mod tests {
     use samod::DocumentId;
 
-    use crate::auth::Did;
+    use crate::auth::{Caller, Did};
     use crate::authz::Authz;
 
     /// Every note in a member's only vault, as path and document ID.
     pub async fn notes_of(authz: &Authz, did: &Did) -> Vec<(String, DocumentId)> {
-        let notes = super::notes::Notes { authz, did };
+        let caller = Caller::from(did.clone());
+        let notes = super::notes::Notes {
+            authz,
+            caller: &caller,
+        };
         let (root, _) = notes.vault(None).await.unwrap();
         notes
             .list(&root, "", true)

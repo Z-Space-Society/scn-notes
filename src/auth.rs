@@ -37,10 +37,56 @@ impl fmt::Display for Did {
     }
 }
 
+/// Who is asking: a member, and the workspaces Corliss said they were in when
+/// it issued their token.
+///
+/// The workspaces are as fresh as the token, so being removed from one takes
+/// effect when the token is next renewed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Caller {
+    pub did: Did,
+    /// Workspace IDs. Every access decision compares these and nothing else.
+    pub workspaces: Vec<String>,
+    /// Each workspace's name as Corliss gave it, by ID, for display only. A
+    /// workspace's vault is listed under it, so a rename in Corliss shows on
+    /// the next token. Empty for a recorded creator, whose names are not kept.
+    pub names: HashMap<String, String>,
+}
+
+impl Caller {
+    pub fn is_in(&self, workspace: &str) -> bool {
+        self.workspaces.iter().any(|w| w == workspace)
+    }
+
+    pub fn name_of(&self, workspace: &str) -> Option<&str> {
+        self.names.get(workspace).map(String::as_str)
+    }
+
+    /// A caller known by workspace IDs alone, as a recorded creator is.
+    pub fn in_workspaces(did: Did, workspaces: Vec<String>) -> Self {
+        Self {
+            did,
+            workspaces,
+            names: HashMap::new(),
+        }
+    }
+}
+
+/// A caller in no workspace.
+impl From<Did> for Caller {
+    fn from(did: Did) -> Self {
+        Self {
+            did,
+            workspaces: Vec::new(),
+            names: HashMap::new(),
+        }
+    }
+}
+
 /// The outcome of a successful check: who, and until when.
 #[derive(Clone, Debug)]
 pub struct Verified {
-    pub did: Did,
+    pub caller: Caller,
     /// When the credential stops being good. A sync connection is closed at
     /// this moment, which is what cuts off a member who has left the network.
     /// `None` only from [`AllowAll`], which has no credential to expire.
@@ -103,7 +149,7 @@ impl DidVerifier for AllowAll {
     ) -> BoxFuture<'a, Result<Verified, AuthError>> {
         Box::pin(async {
             Ok(Verified {
-                did: Did(ANONYMOUS.to_string()),
+                caller: Did(ANONYMOUS.to_string()).into(),
                 expires_at: None,
             })
         })
@@ -146,7 +192,22 @@ pub struct CorlissVerifier {
 struct Claims {
     sub: String,
     exp: u64,
+    /// The workspaces the member was in at issue. Absent from a token issued
+    /// before Corliss sent it, which reads as no workspaces.
+    #[serde(default)]
+    workspaces: Vec<WorkspaceClaim>,
 }
+
+/// One workspace in the `workspaces` claim: `{"id": "7", "name": "Garden"}`.
+#[derive(Deserialize)]
+struct WorkspaceClaim {
+    id: String,
+    name: String,
+}
+
+/// The longest workspace name, in characters, after trimming. The same as a
+/// vault name's, since a workspace's vault is listed under it.
+const MAX_WORKSPACE_NAME: usize = 100;
 
 impl CorlissVerifier {
     /// Build the verifier and load the issuer's keys.
@@ -281,9 +342,26 @@ impl CorlissVerifier {
         if !is_did(&claims.sub) {
             return Err(invalid("subject is not a DID"));
         }
+        let mut workspaces = Vec::with_capacity(claims.workspaces.len());
+        let mut names = HashMap::with_capacity(claims.workspaces.len());
+        for claim in claims.workspaces {
+            if !is_workspace_id(&claim.id) {
+                return Err(invalid("a workspace ID is malformed"));
+            }
+            let name = claim.name.trim();
+            if name.is_empty() || name.chars().count() > MAX_WORKSPACE_NAME {
+                return Err(invalid("a workspace name is empty or too long"));
+            }
+            names.insert(claim.id.clone(), name.to_string());
+            workspaces.push(claim.id);
+        }
 
         Ok(Verified {
-            did: Did(claims.sub),
+            caller: Caller {
+                did: Did(claims.sub),
+                workspaces,
+                names,
+            },
             expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(claims.exp)),
         })
     }
@@ -296,6 +374,18 @@ pub fn is_did(s: &str) -> bool {
     parts.next() == Some("did")
         && parts.next().is_some_and(|method| !method.is_empty())
         && parts.next().is_some_and(|id| !id.is_empty())
+}
+
+/// The longest workspace ID, in bytes.
+const MAX_WORKSPACE_ID: usize = 64;
+
+/// A workspace ID as Corliss writes one: short, and ASCII letters, digits, `-`
+/// and `_` only. The relay never interprets it, only compares it.
+pub fn is_workspace_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_WORKSPACE_ID
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 impl DidVerifier for CorlissVerifier {
@@ -445,11 +535,50 @@ pub(crate) mod tests {
         let spec = TokenSpec::default();
         let exp = spec.claims["exp"].as_u64().unwrap();
         let verified = verify(spec).await.unwrap();
-        assert_eq!(verified.did, Did(MEMBER.to_string()));
+        assert_eq!(verified.caller, Did(MEMBER.to_string()).into());
         assert_eq!(
             verified.expires_at,
             Some(SystemTime::UNIX_EPOCH + Duration::from_secs(exp))
         );
+    }
+
+    #[tokio::test]
+    async fn workspaces_claim_is_read() {
+        let spec = TokenSpec::default().claim(
+            "workspaces",
+            json!([
+                { "id": "7", "name": " Garden Club " },
+                { "id": "garden-2", "name": "Seeds" },
+            ]),
+        );
+        let caller = verify(spec).await.unwrap().caller;
+        assert!(caller.is_in("7"));
+        assert!(caller.is_in("garden-2"));
+        assert!(!caller.is_in("8"));
+        assert_eq!(caller.name_of("7"), Some("Garden Club"));
+        assert_eq!(caller.name_of("8"), None);
+    }
+
+    #[tokio::test]
+    async fn malformed_workspaces_claim_is_refused() {
+        let ok = |id: &str| json!({ "id": id, "name": "Garden" });
+        for bad in [
+            json!([ok("7"), ok("")]),
+            json!([ok("a/b")]),
+            json!([ok(&"x".repeat(65))]),
+            json!([{ "id": "7", "name": "  " }]),
+            json!([{ "id": "7", "name": "x".repeat(101) }]),
+            json!([{ "id": "7" }]),
+            json!([{ "id": 7, "name": "Garden" }]),
+            json!(["7"]),
+            json!("7"),
+        ] {
+            let spec = TokenSpec::default().claim("workspaces", bad.clone());
+            assert!(
+                matches!(verify(spec).await, Err(AuthError::Invalid(_))),
+                "{bad}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -562,8 +691,14 @@ pub(crate) mod tests {
 
         // Past the floor: one refetch finds the new key, and it stays cached.
         expire_floor(&verifier).await;
-        verifier.verify(Some(&rotated), SYNC_AUDIENCE).await.unwrap();
-        verifier.verify(Some(&rotated), SYNC_AUDIENCE).await.unwrap();
+        verifier
+            .verify(Some(&rotated), SYNC_AUDIENCE)
+            .await
+            .unwrap();
+        verifier
+            .verify(Some(&rotated), SYNC_AUDIENCE)
+            .await
+            .unwrap();
         assert_eq!(issuer.fetches.load(Ordering::SeqCst), 2);
     }
 

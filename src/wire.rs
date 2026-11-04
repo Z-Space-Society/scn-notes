@@ -156,8 +156,14 @@ pub(crate) mod tests {
         let mut e = minicbor::Encoder::new(Vec::new());
         e.map(3).unwrap();
         e.str("type").unwrap().str("sync").unwrap();
-        e.str("documentId").unwrap().str(&allowed.to_string()).unwrap();
-        e.str("documentId").unwrap().str(&victim.to_string()).unwrap();
+        e.str("documentId")
+            .unwrap()
+            .str(&allowed.to_string())
+            .unwrap();
+        e.str("documentId")
+            .unwrap()
+            .str(&victim.to_string())
+            .unwrap();
         assert_eq!(read(&e.into_writer()), None);
     }
 

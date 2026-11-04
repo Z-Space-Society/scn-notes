@@ -6,9 +6,9 @@
 //! moved is found where it now is.
 //!
 //! Every document touched is checked twice over: through [`Authz::may_open`],
-//! and against the admission rule, that the caller created it. The second is
-//! what stops a link someone wrote into a folder from leading to a document
-//! that is not the owner's.
+//! and against the vault's admission rule ([`crate::authz::Holder::admits`]).
+//! The second is what stops a link someone wrote into a folder from leading to
+//! a document the vault does not hold.
 //!
 //! Writes are splices into a note's text. Nothing here replaces a note whole:
 //! a replace would discard whatever another device typed in the meantime.
@@ -23,7 +23,7 @@ use automerge::{
 use samod::{AutomergeUrl, DocHandle, DocumentId};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::auth::Did;
+use crate::auth::Caller;
 use crate::authz::Authz;
 use crate::reach::{self, Entry, FOLDER, NOTE};
 
@@ -67,10 +67,40 @@ pub struct Found {
     pub id: DocumentId,
 }
 
-/// One caller's view of the vaults: everything here acts as `did`.
+/// One caller's view of the vaults: everything here acts as `caller`.
 pub struct Notes<'a> {
     pub authz: &'a Authz,
-    pub did: &'a Did,
+    pub caller: &'a Caller,
+}
+
+/// The group a member's own vaults are listed under.
+pub const PRIVATE: &str = "Private";
+/// The group workspaces' vaults are listed under.
+pub const WORKSPACES: &str = "Workspaces";
+
+/// A vault's name with its group: `Private/Notes`, `Workspaces/Garden Club`.
+pub fn qualified(vault: &crate::authz::Vault) -> String {
+    let group = if vault.workspace.is_some() {
+        WORKSPACES
+    } else {
+        PRIVATE
+    };
+    format!("{group}/{}", vault.name)
+}
+
+/// Split `Private/<name>` or `Workspaces/<name>`, in any letter case, into
+/// whether it names a workspace's vault and the bare name. `None` for a name
+/// with neither prefix.
+fn split_group(name: &str) -> Option<(bool, &str)> {
+    let (group, rest) = name.split_once('/')?;
+    let rest = rest.trim();
+    if group.trim().eq_ignore_ascii_case(PRIVATE) {
+        Some((false, rest))
+    } else if group.trim().eq_ignore_ascii_case(WORKSPACES) {
+        Some((true, rest))
+    } else {
+        None
+    }
 }
 
 /// How two names are compared: equal after NFC and case folding. macOS and
@@ -154,9 +184,22 @@ fn content_of(doc: &Automerge) -> Result<ObjId> {
 }
 
 impl Notes<'_> {
-    /// May the caller reach this document through a folder of their vault?
-    fn admitted(&self, doc: &DocumentId) -> bool {
-        self.authz.may_open(self.did, doc) && self.authz.creator_of(doc).as_ref() == Some(self.did)
+    /// May the caller reach this document through this folder?
+    ///
+    /// A folder the index has not walked yet, one a tool made a moment ago,
+    /// is in no vault so far. Then only what the caller made is reachable
+    /// through it, which is the rule that held before workspaces.
+    fn admitted(&self, folder: &DocumentId, doc: &DocumentId) -> bool {
+        if !self.authz.may_open(self.caller, doc) {
+            return false;
+        }
+        let Some(creator) = self.authz.creator(doc) else {
+            return false;
+        };
+        match self.authz.holder_of(folder) {
+            Some(holder) => holder.admits(&creator),
+            None => creator.did == self.caller.did,
+        }
     }
 
     async fn open(&self, doc: &DocumentId) -> Result<DocHandle> {
@@ -168,18 +211,46 @@ impl Notes<'_> {
         }
     }
 
-    /// Find one of the caller's vaults by name, or their only vault if no name
-    /// is given. Returns its root document and its name.
+    /// Find one of the caller's vaults, or their only vault if none is named.
+    /// Returns its root document and its name as [`qualified`] spells it.
+    ///
+    /// A vault is named `Private/<name>` or `Workspaces/<name>`, matching
+    /// `list_vaults`, or by its bare name when only one vault has it. A bare
+    /// name two vaults share is refused rather than guessed at, since a write
+    /// to the wrong one would land where other members can read it, or fail
+    /// to.
     pub async fn vault(&self, name: Option<&str>) -> Result<(DocumentId, String)> {
-        let vaults = self.authz.list_vaults(self.did).await?;
+        let vaults = self.authz.list_vaults(self.caller).await?;
         let chosen = match name.map(str::trim).filter(|name| !name.is_empty()) {
-            Some(name) => vaults
-                .iter()
-                .find(|vault| vault.name.to_lowercase() == name.to_lowercase()),
+            Some(wanted) => {
+                let (group, bare) = match split_group(wanted) {
+                    Some((shared, bare)) => (Some(shared), bare),
+                    None => (None, wanted),
+                };
+                let mut named = vaults.iter().filter(|vault| {
+                    key(&vault.name) == key(bare)
+                        && group.is_none_or(|shared| vault.workspace.is_some() == shared)
+                });
+                let first = named.next();
+                if named.next().is_some() {
+                    return refuse(match group {
+                        None => format!(
+                            "more than one vault is named {bare:?}; say {:?} or {:?}",
+                            format!("{PRIVATE}/{bare}"),
+                            format!("{WORKSPACES}/{bare}"),
+                        ),
+                        Some(_) => format!(
+                            "more than one vault is named {wanted:?}; two workspaces share that \
+                             name, and one of them needs renaming in Corliss"
+                        ),
+                    });
+                }
+                first
+            }
             None if vaults.len() == 1 => vaults.first(),
             None if vaults.is_empty() => None,
             None => {
-                let names: Vec<_> = vaults.iter().map(|vault| vault.name.as_str()).collect();
+                let names: Vec<_> = vaults.iter().map(qualified).collect();
                 return refuse(format!(
                     "you have more than one vault; name one of: {}",
                     names.join(", ")
@@ -189,7 +260,7 @@ impl Notes<'_> {
         match chosen {
             Some(vault) => Ok((
                 DocumentId::from_str(&vault.root_doc_id).map_err(|e| anyhow::anyhow!("{e:?}"))?,
-                vault.name.clone(),
+                qualified(vault),
             )),
             None => refuse("no vault by that name; list_vaults shows the ones you have"),
         }
@@ -215,7 +286,7 @@ impl Notes<'_> {
                 continue;
             }
             let Some(id) = entry.doc_id() else { continue };
-            if !self.admitted(&id) {
+            if !self.admitted(folder, &id) {
                 continue;
             }
             let item = Item {
@@ -343,7 +414,7 @@ impl Notes<'_> {
             .await
             .map_err(|_| anyhow::anyhow!("repo stopped"))?;
         self.authz
-            .record_creator(handle.document_id(), self.did)
+            .record_creator(handle.document_id(), self.caller)
             .await?;
         Ok(AutomergeUrl::from(handle.document_id()).to_string())
     }
@@ -411,7 +482,9 @@ impl Notes<'_> {
         }
 
         if self.taken(&folder, &file).await? {
-            return refuse(format!("{path} already exists; use edit_note or append_note"));
+            return refuse(format!(
+                "{path} already exists; use edit_note or append_note"
+            ));
         }
         // The note first, then its entry: an entry is never left pointing at
         // a document that does not exist.
@@ -510,7 +583,10 @@ mod tests {
 
     #[test]
     fn narrow_leaves_only_what_differs() {
-        assert_eq!(narrow("the quick fox", "the slow fox"), ("the ", "quick", "slow"));
+        assert_eq!(
+            narrow("the quick fox", "the slow fox"),
+            ("the ", "quick", "slow")
+        );
         assert_eq!(narrow("abc", "abcd"), ("abc", "", "d"));
         assert_eq!(narrow("abcd", "abc"), ("abc", "d", ""));
         assert_eq!(narrow("aXa", "aa"), ("a", "X", ""));
@@ -536,7 +612,10 @@ mod tests {
 
     #[test]
     fn paths_split_into_segments() {
-        assert_eq!(segments("/Projects//plan.md/").unwrap(), ["Projects", "plan.md"]);
+        assert_eq!(
+            segments("/Projects//plan.md/").unwrap(),
+            ["Projects", "plan.md"]
+        );
         assert!(segments("").unwrap().is_empty());
         assert!(matches!(segments("a/../b"), Err(NoteError::Refused(_))));
     }

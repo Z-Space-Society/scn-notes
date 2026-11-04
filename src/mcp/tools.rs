@@ -14,9 +14,9 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::json;
 
-use super::notes::{NoteError, Notes};
+use super::notes::{qualified, NoteError, Notes, PRIVATE, WORKSPACES};
 use super::search;
-use crate::auth::Did;
+use crate::auth::Caller;
 use crate::authz::Authz;
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -30,7 +30,9 @@ pub struct NotesServer {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ListNotes {
-    /// Vault name. May be left out when you have exactly one vault.
+    /// Vault, as list_vaults gives it: "Private/<name>" or
+    /// "Workspaces/<name>". The bare name works when only one vault has it.
+    /// May be left out when you have exactly one vault.
     vault: Option<String>,
     /// Folder to list, such as "Projects/2026". Leave out for the top level.
     path: Option<String>,
@@ -40,7 +42,9 @@ pub struct ListNotes {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ReadNote {
-    /// Vault name. May be left out when you have exactly one vault.
+    /// Vault, as list_vaults gives it: "Private/<name>" or
+    /// "Workspaces/<name>". The bare name works when only one vault has it.
+    /// May be left out when you have exactly one vault.
     vault: Option<String>,
     /// Path of the note, such as "Projects/plan.md".
     path: String,
@@ -48,7 +52,9 @@ pub struct ReadNote {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct SearchNotes {
-    /// Vault name. May be left out when you have exactly one vault.
+    /// Vault, as list_vaults gives it: "Private/<name>" or
+    /// "Workspaces/<name>". The bare name works when only one vault has it.
+    /// May be left out when you have exactly one vault.
     vault: Option<String>,
     /// Words to look for. A note matches when it contains all of them, in its
     /// text or its path, in any letter case.
@@ -59,7 +65,9 @@ pub struct SearchNotes {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct CreateNote {
-    /// Vault name. May be left out when you have exactly one vault.
+    /// Vault, as list_vaults gives it: "Private/<name>" or
+    /// "Workspaces/<name>". The bare name works when only one vault has it.
+    /// May be left out when you have exactly one vault.
     vault: Option<String>,
     /// Path for the new note, ending in ".md", such as "Projects/plan.md".
     /// Folders on the way that do not exist are created.
@@ -70,7 +78,9 @@ pub struct CreateNote {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct EditNote {
-    /// Vault name. May be left out when you have exactly one vault.
+    /// Vault, as list_vaults gives it: "Private/<name>" or
+    /// "Workspaces/<name>". The bare name works when only one vault has it.
+    /// May be left out when you have exactly one vault.
     vault: Option<String>,
     /// Path of the note, such as "Projects/plan.md".
     path: String,
@@ -85,7 +95,9 @@ pub struct EditNote {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct AppendNote {
-    /// Vault name. May be left out when you have exactly one vault.
+    /// Vault, as list_vaults gives it: "Private/<name>" or
+    /// "Workspaces/<name>". The bare name works when only one vault has it.
+    /// May be left out when you have exactly one vault.
     vault: Option<String>,
     /// Path of the note, such as "Projects/plan.md".
     path: String,
@@ -108,16 +120,19 @@ fn failed(e: NoteError) -> Result<CallToolResult, ErrorData> {
         NoteError::Refused(why) => Ok(CallToolResult::error(vec![ContentBlock::text(why)])),
         NoteError::Internal(e) => {
             tracing::error!(error = %e, "a tool failed");
-            Err(ErrorData::internal_error("the relay could not do that", None))
+            Err(ErrorData::internal_error(
+                "the relay could not do that",
+                None,
+            ))
         }
     }
 }
 
 /// The member the request was authenticated as.
-fn caller(parts: &Parts) -> Result<Did, ErrorData> {
+fn caller(parts: &Parts) -> Result<Caller, ErrorData> {
     parts
         .extensions
-        .get::<Did>()
+        .get::<Caller>()
         .cloned()
         // Unreachable behind the middleware. Refused rather than assumed.
         .ok_or_else(|| ErrorData::invalid_request("not authenticated", None))
@@ -133,23 +148,32 @@ impl NotesServer {
     }
 
     #[tool(
-        description = "List your vaults. A vault is a separate collection of notes.",
+        description = "List your vaults, in two groups. Private vaults are yours alone. Workspaces vaults each belong to a workspace you are in, and every member of it can read and change its notes. Each vault's \"vault\" value is how the other tools name it.",
         annotations(title = "List vaults", read_only_hint = true)
     )]
     async fn list_vaults(
         &self,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, ErrorData> {
-        let did = caller(&parts)?;
-        match self.authz.list_vaults(&did).await {
-            Ok(vaults) => listed(json!(vaults
-                .iter()
-                .map(|vault| json!({
-                    "name": vault.name,
-                    "created_at": vault.created_at,
-                    "last_change_at": vault.last_change_at,
-                }))
-                .collect::<Vec<_>>())),
+        let caller = caller(&parts)?;
+        match self.authz.list_vaults(&caller).await {
+            Ok(vaults) => {
+                let group = |shared: bool| {
+                    vaults
+                        .iter()
+                        .filter(|vault| vault.workspace.is_some() == shared)
+                        .map(|vault| {
+                            json!({
+                                "vault": qualified(vault),
+                                "name": vault.name,
+                                "created_at": vault.created_at,
+                                "last_change_at": vault.last_change_at,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
+                listed(json!({ PRIVATE: group(false), WORKSPACES: group(true) }))
+            }
             Err(e) => failed(NoteError::Internal(e)),
         }
     }
@@ -163,10 +187,10 @@ impl NotesServer {
         Parameters(args): Parameters<ListNotes>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, ErrorData> {
-        let did = caller(&parts)?;
+        let caller = caller(&parts)?;
         let notes = Notes {
             authz: &self.authz,
-            did: &did,
+            caller: &caller,
         };
         let found = async {
             let (root, _) = notes.vault(args.vault.as_deref()).await?;
@@ -199,10 +223,10 @@ impl NotesServer {
         Parameters(args): Parameters<ReadNote>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, ErrorData> {
-        let did = caller(&parts)?;
+        let caller = caller(&parts)?;
         let notes = Notes {
             authz: &self.authz,
-            did: &did,
+            caller: &caller,
         };
         let text = async {
             let (root, _) = notes.vault(args.vault.as_deref()).await?;
@@ -224,10 +248,10 @@ impl NotesServer {
         Parameters(args): Parameters<SearchNotes>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, ErrorData> {
-        let did = caller(&parts)?;
+        let caller = caller(&parts)?;
         let notes = Notes {
             authz: &self.authz,
-            did: &did,
+            caller: &caller,
         };
         let limit = args
             .limit
@@ -252,17 +276,21 @@ impl NotesServer {
 
     #[tool(
         description = "Create a new note. Fails if something already exists at the path.",
-        annotations(title = "Create note", read_only_hint = false, destructive_hint = false)
+        annotations(
+            title = "Create note",
+            read_only_hint = false,
+            destructive_hint = false
+        )
     )]
     async fn create_note(
         &self,
         Parameters(args): Parameters<CreateNote>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, ErrorData> {
-        let did = caller(&parts)?;
+        let caller = caller(&parts)?;
         let notes = Notes {
             authz: &self.authz,
-            did: &did,
+            caller: &caller,
         };
         let created = async {
             let (root, vault) = notes.vault(args.vault.as_deref()).await?;
@@ -285,10 +313,10 @@ impl NotesServer {
         Parameters(args): Parameters<EditNote>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, ErrorData> {
-        let did = caller(&parts)?;
+        let caller = caller(&parts)?;
         let notes = Notes {
             authz: &self.authz,
-            did: &did,
+            caller: &caller,
         };
         let path = args.path.clone();
         let edited = async {
@@ -312,17 +340,21 @@ impl NotesServer {
 
     #[tool(
         description = "Add text to the end of a note.",
-        annotations(title = "Append to note", read_only_hint = false, destructive_hint = false)
+        annotations(
+            title = "Append to note",
+            read_only_hint = false,
+            destructive_hint = false
+        )
     )]
     async fn append_note(
         &self,
         Parameters(args): Parameters<AppendNote>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, ErrorData> {
-        let did = caller(&parts)?;
+        let caller = caller(&parts)?;
         let notes = Notes {
             authz: &self.authz,
-            did: &did,
+            caller: &caller,
         };
         let path = args.path.clone();
         let appended = async {
