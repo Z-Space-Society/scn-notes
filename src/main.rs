@@ -11,6 +11,7 @@ mod filter;
 mod mcp;
 mod reach;
 mod storage;
+mod unfiled;
 mod vaults;
 mod wire;
 
@@ -64,34 +65,18 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
+
+    // `file-unfiled` is run by hand, with the service stopped; see `unfiled`.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("file-unfiled") {
+        let (repo, authz) = open_relay(&config).await?;
+        let result = file_unfiled(&authz, &args[1..]).await;
+        repo.stop().await;
+        return result;
+    }
+
     let verifier = build_verifier(&config).await?;
-
-    // A small pool: this is a relay, not a web app. Connections are held only
-    // for the duration of a storage call, and samod serialises per document.
-    let pool = PgPoolOptions::new()
-        .max_connections(16)
-        .connect(&config.database_url)
-        .await
-        .context("could not connect to Postgres")?;
-
-    let store = PostgresStorage::new(pool.clone());
-    store
-        .migrate()
-        .await
-        .context("could not create the storage schema")?;
-
-    // The relay never offers a document unasked, and never asks one peer for
-    // a document on behalf of another. A peer gets what it requests and may
-    // open, and a change still reaches every peer already syncing that
-    // document.
-    let repo = Repo::build_tokio()
-        .with_storage(store)
-        .with_announce_policy(NeverAnnounce)
-        .load()
-        .await;
-    let authz = Authz::load(pool, repo.clone())
-        .await
-        .context("could not load the ownership records")?;
+    let (repo, authz) = open_relay(&config).await?;
 
     // The URL is used only to identify this endpoint in samod's own logs; it
     // is not something the relay binds or dials.
@@ -159,6 +144,112 @@ async fn main() -> Result<()> {
     tokio::try_join!(sync.into_future(), mcp.into_future()).context("server error")?;
 
     Ok(())
+}
+
+/// The storage, the repo and the ownership records: what the server and the
+/// one-off commands share.
+async fn open_relay(config: &Config) -> Result<(Repo, Authz)> {
+    // A small pool: this is a relay, not a web app. Connections are held only
+    // for the duration of a storage call, and samod serialises per document.
+    let pool = PgPoolOptions::new()
+        .max_connections(16)
+        .connect(&config.database_url)
+        .await
+        .context("could not connect to Postgres")?;
+
+    let store = PostgresStorage::new(pool.clone());
+    store
+        .migrate()
+        .await
+        .context("could not create the storage schema")?;
+
+    // The relay never offers a document unasked, and never asks one peer for
+    // a document on behalf of another. A peer gets what it requests and may
+    // open, and a change still reaches every peer already syncing that
+    // document.
+    let repo = Repo::build_tokio()
+        .with_storage(store)
+        .with_announce_policy(NeverAnnounce)
+        .load()
+        .await;
+    let authz = Authz::load(pool, repo.clone())
+        .await
+        .context("could not load the ownership records")?;
+
+    Ok((repo, authz))
+}
+
+/// How long `file-unfiled` waits for the index to walk every vault.
+const WALK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `file-unfiled <did> [--folder <name>] [--apply]`: list a member's documents
+/// that no vault reaches, and with `--apply` link them into a new folder at
+/// the root of their private vault.
+async fn file_unfiled(authz: &Authz, args: &[String]) -> Result<()> {
+    const USAGE: &str = "usage: scn-sync-relay file-unfiled <did> [--folder <name>] [--apply]";
+    let mut did = None;
+    let mut folder = "Recovered".to_string();
+    let mut apply = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--apply" => apply = true,
+            "--folder" => folder = args.next().context(USAGE)?.clone(),
+            other if did.is_none() && auth::is_did(other) => {
+                did = Some(auth::Did(other.to_string()))
+            }
+            _ => anyhow::bail!(USAGE),
+        }
+    }
+    let did = did.context(USAGE)?;
+
+    let started = std::time::Instant::now();
+    let orphans = loop {
+        if let Some(orphans) = authz.orphans_of(&did).await? {
+            break orphans;
+        }
+        anyhow::ensure!(
+            started.elapsed() < WALK_TIMEOUT,
+            "the index did not walk every vault in {WALK_TIMEOUT:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+
+    println!("{} outside every vault for {}:", orphans.len(), did.0);
+    for orphan in &orphans {
+        let kind = match orphan.kind {
+            unfiled::Kind::Folder => format!("folder, {} inside", orphan.inside),
+            unfiled::Kind::Note => "note".to_string(),
+            unfiled::Kind::Other => "other, not filed".to_string(),
+        };
+        let created = orphan
+            .created_at
+            .map(|at| at.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "  {created}  {:>7} B  {:<40}  ({kind})  {}",
+            orphan.bytes,
+            orphan.name.as_deref().unwrap_or("(no name)"),
+            orphan.first_line.as_deref().unwrap_or(""),
+        );
+    }
+    if !apply {
+        println!("Nothing changed. Run again with --apply to put these in {folder:?} in the private vault.");
+        return Ok(());
+    }
+    match authz.file_orphans(&did, &folder, &orphans).await {
+        Ok(linked) => {
+            println!(
+                "Put {} in {folder:?} at the root of the private vault:",
+                linked.len()
+            );
+            for (id, name) in linked {
+                println!("  {name}  ({id})");
+            }
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("nothing changed: {e}")),
+    }
 }
 
 fn router(state: AppState) -> Router {

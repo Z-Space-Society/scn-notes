@@ -434,7 +434,7 @@ impl Authz {
     }
 
     /// The bytes these documents take in storage.
-    async fn bytes_of(&self, docs: &[String]) -> Result<i64> {
+    pub(crate) async fn bytes_of(&self, docs: &[String]) -> Result<i64> {
         // A document's rows are the keys from `<id>/` up to `<id>0`, `0`
         // being the character after `/`. The `~>=~` and `~<~` operators
         // are the ones `text_pattern_ops` serves, so this is one index
@@ -648,7 +648,7 @@ pub(crate) mod tests {
     }
 
     impl Authz {
-        fn vault_of(&self, doc: &DocumentId) -> Option<DocumentId> {
+        pub fn vault_of(&self, doc: &DocumentId) -> Option<DocumentId> {
             self.0.reach.read().unwrap().vault_of(doc).cloned()
         }
 
@@ -674,7 +674,7 @@ pub(crate) mod tests {
 
     /// A document as a sync client would have sent it: stored, with `creator`
     /// recorded as its first sender.
-    async fn sent(authz: &Authz, repo: &Repo, creator: &Did, doc: Automerge) -> DocHandle {
+    pub async fn sent(authz: &Authz, repo: &Repo, creator: &Did, doc: Automerge) -> DocHandle {
         let handle = repo.create(doc).await.unwrap();
         authz.record(handle.document_id(), creator).await.unwrap();
         handle
@@ -693,7 +693,7 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    async fn unlink(folder: &DocHandle, index: usize) {
+    pub async fn unlink(folder: &DocHandle, index: usize) {
         folder
             .with_document_async(move |doc| {
                 let (_, docs) = doc.get(ROOT, "docs").unwrap().unwrap();
@@ -705,7 +705,12 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    async fn vault(authz: &Authz, repo: &Repo, owner: &Did, name: &str) -> (DocumentId, DocHandle) {
+    pub async fn vault(
+        authz: &Authz,
+        repo: &Repo,
+        owner: &Did,
+        name: &str,
+    ) -> (DocumentId, DocHandle) {
         let vault = authz.create_vault(owner, name).await.unwrap();
         let root = DocumentId::from_str(&vault.root_doc_id).unwrap();
         let handle = repo.find(root.clone()).await.unwrap().unwrap();

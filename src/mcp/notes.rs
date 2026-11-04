@@ -147,7 +147,10 @@ fn narrow<'a>(old: &'a str, new: &'a str) -> (&'a str, &'a str, &'a str) {
 
 /// A note document: `{"@patchwork": {"type": "file"}, name, extension,
 /// mimeType, content}`, with `content` a text object holding the text exactly.
-fn new_note(name: &str, content: &str) -> std::result::Result<Automerge, AutomergeError> {
+pub(crate) fn new_note(
+    name: &str,
+    content: &str,
+) -> std::result::Result<Automerge, AutomergeError> {
     let mut doc = Automerge::new();
     let mut tx = doc.transaction();
     let patchwork = tx.put_object(ROOT, "@patchwork", ObjType::Map)?;
