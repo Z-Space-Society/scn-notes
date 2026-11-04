@@ -26,7 +26,7 @@ use axum::{
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, put},
     Json, Router,
 };
 use samod::{AcceptorHandle, NeverAnnounce, Repo};
@@ -291,12 +291,8 @@ fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/vaults", get(vaults::list_own))
         .route("/.well-known/oauth-protected-resource", get(sync_metadata))
-        .route(
-            "/internal/vaults",
-            get(vaults::list_for_member)
-                .post(vaults::create)
-                .patch(vaults::rename),
-        )
+        .route("/internal/vaults", get(vaults::list_for_member))
+        .route("/internal/vaults/workspace", put(vaults::workspace))
         .route("/internal/vaults/all", get(vaults::list_all))
         .with_state(state)
 }
@@ -503,19 +499,44 @@ mod tests {
         TokenSpec::default().claim("sub", json!(did)).sign()
     }
 
-    async fn create_vault(base: &str, did: &str, name: &str) -> (StatusCode, Value) {
+    /// The member's private vault, as Corliss's listing makes and finds it.
+    async fn private_vault(base: &str, did: &str) -> (StatusCode, Value) {
         let response = reqwest::Client::new()
-            .post(format!("{base}/internal/vaults"))
+            .get(format!("{base}/internal/vaults?did={did}"))
             .bearer_auth(SERVICE_TOKEN)
-            .json(&json!({ "did": did, "name": name }))
             .send()
             .await
             .unwrap();
-        (response.status(), response.json().await.unwrap())
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        let private = body["vaults"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|vault| vault["workspace"].is_null())
+            .cloned()
+            .unwrap();
+        (status, private)
     }
 
-    /// The names of the vaults a listing returns.
-    async fn names(request: reqwest::RequestBuilder) -> Vec<String> {
+    /// The workspace's vault, as Corliss asks for it.
+    async fn workspace_vault(
+        base: &str,
+        did: &str,
+        workspace: &str,
+        name: &str,
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .put(format!("{base}/internal/vaults/workspace"))
+            .bearer_auth(SERVICE_TOKEN)
+            .json(&json!({ "did": did, "workspace": workspace, "name": name }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// The paths of the vaults a listing returns.
+    async fn vault_paths(request: reqwest::RequestBuilder) -> Vec<String> {
         let response = request.send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value = response.json().await.unwrap();
@@ -523,7 +544,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|vault| vault["name"].as_str().unwrap().to_string())
+            .map(|vault| vault["path"].as_str().unwrap().to_string())
             .collect()
     }
 
@@ -557,13 +578,13 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn corliss_creates_a_vault_only_its_owner_can_open(pool: PgPool) {
+    async fn a_listing_makes_the_private_vault_only_its_owner_can_open(pool: PgPool) {
         let (base, authz) = relay(&pool).await;
 
-        let (status, vault) = create_vault(&base, ALICE, "Notes").await;
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(vault["name"], "Notes");
-        assert_eq!(vault["path"], "Private/Notes");
+        let (status, vault) = private_vault(&base, ALICE).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(vault["name"].is_null());
+        assert_eq!(vault["path"], "Private");
         assert_eq!(
             vault["url"],
             format!("automerge:{}", vault["root_doc_id"].as_str().unwrap())
@@ -574,172 +595,115 @@ mod tests {
         let root = vault["root_doc_id"].as_str().unwrap().parse().unwrap();
         assert!(authz.opens(&auth::Did(ALICE.into()), &root));
         assert!(!authz.opens(&auth::Did(BOB.into()), &root));
-    }
 
-    #[sqlx::test(migrations = false)]
-    async fn create_refuses_duplicates_and_bad_input(pool: PgPool) {
-        let (base, _) = relay(&pool).await;
-        create_vault(&base, ALICE, "Notes").await;
+        // The member's own listing finds the same one.
+        let own: Value = reqwest::Client::new()
+            .get(format!("{base}/vaults"))
+            .bearer_auth(member_token(ALICE))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(own["vaults"].as_array().unwrap().len(), 1);
+        assert_eq!(own["vaults"][0]["root_doc_id"], vault["root_doc_id"]);
 
-        let (status, body) = create_vault(&base, ALICE, "NOTES").await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"], "name_taken");
-
-        let (status, _) = create_vault(&base, BOB, "Notes").await;
-        assert_eq!(status, StatusCode::CREATED);
-
-        let (status, body) = create_vault(&base, ALICE, "  ").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "invalid_name");
-
-        let (status, body) = create_vault(&base, "alice", "Other").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "invalid_did");
+        let response = reqwest::Client::new()
+            .get(format!("{base}/internal/vaults?did=alice"))
+            .bearer_auth(SERVICE_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[sqlx::test(migrations = false)]
     async fn listings_show_only_the_members_own_vaults(pool: PgPool) {
         let (base, _) = relay(&pool).await;
-        create_vault(&base, ALICE, "Notes").await;
-        create_vault(&base, ALICE, "Work").await;
-        create_vault(&base, BOB, "Private").await;
-        let client = reqwest::Client::new();
+        let (_, alices) = private_vault(&base, ALICE).await;
+        let (_, bobs) = private_vault(&base, BOB).await;
+        assert_ne!(alices["root_doc_id"], bobs["root_doc_id"]);
 
-        let own = client
+        let own: Value = reqwest::Client::new()
             .get(format!("{base}/vaults"))
-            .bearer_auth(member_token(ALICE));
-        assert_eq!(names(own).await, ["Notes", "Work"]);
-
-        let for_bob = client
-            .get(format!("{base}/internal/vaults?did={BOB}"))
-            .bearer_auth(SERVICE_TOKEN);
-        assert_eq!(names(for_bob).await, ["Private"]);
-
-        let nobody = client
-            .get(format!("{base}/vaults"))
-            .bearer_auth(member_token("did:plc:carol"));
-        assert!(names(nobody).await.is_empty());
+            .bearer_auth(member_token(ALICE))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let roots: Vec<_> = own["vaults"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|vault| vault["root_doc_id"].clone())
+            .collect();
+        assert_eq!(roots, [alices["root_doc_id"].clone()]);
     }
 
     #[sqlx::test(migrations = false)]
     async fn a_workspace_vault_lists_for_whoever_the_token_puts_in_it(pool: PgPool) {
         let (base, _) = relay(&pool).await;
         let client = reqwest::Client::new();
-        let create = |body: Value| {
-            client
-                .post(format!("{base}/internal/vaults"))
-                .bearer_auth(SERVICE_TOKEN)
-                .json(&body)
-                .send()
-        };
 
-        let response = create(json!({ "did": ALICE, "name": "Garden", "workspace": "7" }))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
+        let response = workspace_vault(&base, ALICE, "7", "Garden").await;
+        assert_eq!(response.status(), StatusCode::OK);
         let vault: Value = response.json().await.unwrap();
         assert_eq!(vault["workspace"], "7");
         assert_eq!(vault["path"], "Workspaces/Garden");
 
-        let response = create(json!({ "did": BOB, "name": "Other", "workspace": "7" }))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body: Value = response.json().await.unwrap();
-        assert_eq!(body["error"], "workspace_has_vault");
+        // Asked again by another member: the same vault, and the name sent is
+        // the one it carries, which is how a rename in Corliss reaches it.
+        let response = workspace_vault(&base, BOB, "7", " Garden Club ").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let again: Value = response.json().await.unwrap();
+        assert_eq!(again["root_doc_id"], vault["root_doc_id"]);
+        assert_eq!(again["path"], "Workspaces/Garden Club");
 
-        let response = create(json!({ "did": BOB, "name": "Bad", "workspace": "a/b" }))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        create_vault(&base, BOB, "Private").await;
         let bob_in_7 = TokenSpec::default()
             .claim("sub", json!(BOB))
             .claim("workspaces", json!(["7"]))
             .sign();
         let own = client.get(format!("{base}/vaults")).bearer_auth(&bob_in_7);
-        assert_eq!(names(own).await, ["Garden", "Private"]);
+        assert_eq!(
+            vault_paths(own).await,
+            ["Workspaces/Garden Club", "Private"]
+        );
 
         // Alice made it, and a token naming no workspace still does not list it.
         let alice = client
             .get(format!("{base}/vaults"))
             .bearer_auth(member_token(ALICE));
-        assert!(names(alice).await.is_empty());
+        assert_eq!(vault_paths(alice).await, ["Private"]);
 
         let for_bob = client
             .get(format!("{base}/internal/vaults?did={BOB}&workspaces=7,9"))
             .bearer_auth(SERVICE_TOKEN);
-        assert_eq!(names(for_bob).await, ["Garden", "Private"]);
+        assert_eq!(
+            vault_paths(for_bob).await,
+            ["Workspaces/Garden Club", "Private"]
+        );
 
-        // The workspace is renamed in Corliss, which tells the relay.
-        let rename = |body: Value| {
-            client
-                .patch(format!("{base}/internal/vaults"))
-                .bearer_auth(SERVICE_TOKEN)
-                .json(&body)
-                .send()
-        };
-        let response = rename(json!({ "workspace": "7", "name": " Garden Club " }))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let own = client.get(format!("{base}/vaults")).bearer_auth(&bob_in_7);
-        let listed: Value = own.send().await.unwrap().json().await.unwrap();
-        let paths: Vec<_> = listed["vaults"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|vault| vault["path"].as_str().unwrap())
-            .collect();
-        assert_eq!(paths, ["Workspaces/Garden Club", "Private/Private"]);
-
-        for (body, status, code) in [
-            (
-                json!({ "workspace": "9", "name": "Seeds" }),
-                StatusCode::NOT_FOUND,
-                "no_vault",
-            ),
-            (
-                json!({ "workspace": "7", "name": "  " }),
-                StatusCode::BAD_REQUEST,
-                "invalid_name",
-            ),
-            (
-                json!({ "workspace": "a/b", "name": "Seeds" }),
-                StatusCode::BAD_REQUEST,
-                "invalid_workspace",
-            ),
+        for (did, workspace, name, code) in [
+            (BOB, "7", "  ", "invalid_name"),
+            (BOB, "a/b", "Seeds", "invalid_workspace"),
+            ("bob", "7", "Seeds", "invalid_did"),
         ] {
-            let response = rename(body.clone()).await.unwrap();
-            assert_eq!(response.status(), status, "{body}");
+            let response = workspace_vault(&base, did, workspace, name).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{code}");
             let answer: Value = response.json().await.unwrap();
-            assert_eq!(answer["error"], code, "{body}");
+            assert_eq!(answer["error"], code);
         }
-
-        // Without the service credential, nothing is renamed.
-        let response = client
-            .patch(format!("{base}/internal/vaults"))
-            .bearer_auth(member_token(BOB))
-            .json(&json!({ "workspace": "7", "name": "Mine" }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[sqlx::test(migrations = false)]
     async fn the_admin_listing_is_everyones_and_takes_no_parameters(pool: PgPool) {
         let (base, authz) = relay(&pool).await;
-        create_vault(&base, ALICE, "Notes").await;
-        create_vault(&base, BOB, "Private").await;
-        reqwest::Client::new()
-            .post(format!("{base}/internal/vaults"))
-            .bearer_auth(SERVICE_TOKEN)
-            .json(&json!({ "did": BOB, "name": "Garden", "workspace": "7" }))
-            .send()
-            .await
-            .unwrap();
+        private_vault(&base, ALICE).await;
+        private_vault(&base, BOB).await;
+        workspace_vault(&base, BOB, "7", "Garden").await;
         authz::tests::eventually("every vault is walked", || authz.all_walked()).await;
 
         let client = reqwest::Client::new();
@@ -765,8 +729,8 @@ mod tests {
         assert_eq!(
             listed,
             [
-                (ALICE, "Private/Notes"),
-                (BOB, "Private/Private"),
+                (ALICE, "Private"),
+                (BOB, "Private"),
                 (BOB, "Workspaces/Garden"),
             ]
         );
@@ -801,7 +765,8 @@ mod tests {
         let member = member_token(ALICE);
         let internal = format!("{base}/internal/vaults");
         let for_alice = format!("{internal}?did={ALICE}");
-        let body = json!({ "did": ALICE, "name": "Notes" });
+        let body = json!({ "did": ALICE, "workspace": "7", "name": "Notes" });
+        let workspace = format!("{internal}/workspace");
 
         for request in [
             // The member endpoint: no token, the service credential, a token
@@ -820,9 +785,9 @@ mod tests {
             client.get(&for_alice),
             client.get(&for_alice).bearer_auth("wrong"),
             client.get(&for_alice).bearer_auth(&member),
-            client.post(&internal).json(&body),
-            client.post(&internal).json(&body).bearer_auth("wrong"),
-            client.post(&internal).json(&body).bearer_auth(&member),
+            client.put(&workspace).json(&body),
+            client.put(&workspace).json(&body).bearer_auth("wrong"),
+            client.put(&workspace).json(&body).bearer_auth(&member),
             client.get(format!("{internal}/all")),
             client.get(format!("{internal}/all")).bearer_auth("wrong"),
             client.get(format!("{internal}/all")).bearer_auth(&member),
@@ -835,13 +800,13 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn a_restart_keeps_vault_records(pool: PgPool) {
         let (base, _) = relay(&pool).await;
-        create_vault(&base, ALICE, "Notes").await;
+        private_vault(&base, ALICE).await;
 
         let (base, _) = relay(&pool).await;
         let own = reqwest::Client::new()
             .get(format!("{base}/vaults"))
             .bearer_auth(member_token(ALICE));
-        assert_eq!(names(own).await, ["Notes"]);
+        assert_eq!(vault_paths(own).await, ["Private"]);
     }
 
     /// Dials the relay's websocket the way a sync client does, token in the
@@ -950,7 +915,7 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn a_vault_root_reaches_its_owner_only(pool: PgPool) {
         let (base, _) = relay(&pool).await;
-        let (_, vault) = create_vault(&base, ALICE, "Notes").await;
+        let (_, vault) = private_vault(&base, ALICE).await;
         let root: samod::DocumentId = vault["root_doc_id"].as_str().unwrap().parse().unwrap();
 
         let alice = client(&base, ALICE).await;
@@ -1149,28 +1114,22 @@ mod tests {
         // Created under one name and renamed with its workspace.
         relay
             .authz
-            .create_workspace_vault(&auth::Did(ALICE.into()), "7", "Old name")
+            .workspace_vault(&auth::Did(ALICE.into()), "7", "Old name")
             .await
             .unwrap();
-        assert!(relay
-            .authz
-            .rename_workspace_vault("7", "Notes")
-            .await
-            .unwrap());
         relay
             .authz
-            .create_vault(&auth::Did(BOB.into()), "Notes")
+            .workspace_vault(&auth::Did(ALICE.into()), "7", "Notes")
             .await
             .unwrap();
         let in_7 = ["7"];
 
-        // Alice writes to the workspace's vault, her only one.
         let (is_error, text) = relay
             .call_in(
                 ALICE,
                 &in_7,
                 "create_note",
-                json!({ "path": "plan.md", "content": "dig beds" }),
+                json!({ "vault": "Workspaces/Notes", "path": "plan.md", "content": "dig beds" }),
             )
             .await;
         assert!(!is_error, "{text}");
@@ -1179,7 +1138,12 @@ mod tests {
         let alice = auth::Caller::in_workspaces(auth::Did(ALICE.into()), vec!["7".into()]);
         let mut walked = false;
         for _ in 0..200 {
-            if relay.authz.list_vaults(&alice).await.unwrap()[0].note_count == Some(1) {
+            let vaults = relay.authz.list_vaults(&alice).await.unwrap();
+            let shared = vaults
+                .iter()
+                .find(|vault| vault.workspace.is_some())
+                .unwrap();
+            if shared.note_count == Some(1) {
                 walked = true;
                 break;
             }
@@ -1187,7 +1151,8 @@ mod tests {
         }
         assert!(walked, "the note never joined the vault");
 
-        // Bob's vaults, in their two groups.
+        // Bob's vaults, in their two groups. His private vault is made by
+        // this first listing.
         let (is_error, text) = relay.call_in(BOB, &in_7, "list_vaults", json!({})).await;
         assert!(!is_error, "{text}");
         let listed: Value = serde_json::from_str(&text).unwrap();
@@ -1199,31 +1164,57 @@ mod tests {
                 .map(|vault| vault["vault"].as_str().unwrap().to_string())
                 .collect()
         };
-        assert_eq!(named("Private"), ["Private/Notes"]);
+        assert_eq!(named("Private"), ["Private"]);
         assert_eq!(named("Workspaces"), ["Workspaces/Notes"]);
+        assert!(listed["Private"][0]["name"].is_null());
 
-        // Both are named Notes, so the bare name is refused.
-        let (is_error, why) = relay
+        // The workspace's vault by its full path or its bare name.
+        for vault in ["workspaces/Notes", "notes"] {
+            let (is_error, text) = relay
+                .call_in(
+                    BOB,
+                    &in_7,
+                    "read_note",
+                    json!({ "vault": vault, "path": "plan.md" }),
+                )
+                .await;
+            assert!(!is_error, "{vault}: {text}");
+            assert!(text.contains("dig beds"), "{text}");
+        }
+
+        // No vault named is his private vault, which "Private" names too.
+        let (is_error, text) = relay
             .call_in(
                 BOB,
                 &in_7,
-                "read_note",
-                json!({ "vault": "notes", "path": "plan.md" }),
+                "create_note",
+                json!({ "path": "mine.md", "content": "just me" }),
             )
             .await;
-        assert!(is_error);
-        assert!(why.contains("Workspaces/notes"), "{why}");
-
+        assert!(!is_error, "{text}");
+        assert!(text.contains("Private"), "{text}");
         let (is_error, text) = relay
             .call_in(
                 BOB,
                 &in_7,
                 "read_note",
-                json!({ "vault": "workspaces/Notes", "path": "plan.md" }),
+                json!({ "vault": "private", "path": "mine.md" }),
             )
             .await;
         assert!(!is_error, "{text}");
-        assert!(text.contains("dig beds"), "{text}");
+        assert!(text.contains("just me"), "{text}");
+
+        // The old private path names nothing now.
+        let (is_error, why) = relay
+            .call_in(
+                BOB,
+                &in_7,
+                "read_note",
+                json!({ "vault": "Private/Notes", "path": "mine.md" }),
+            )
+            .await;
+        assert!(is_error);
+        assert!(why.contains("no name after it"), "{why}");
 
         // Without the workspace in his token, there is no such vault.
         let why = relay
@@ -1311,13 +1302,13 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn a_member_creates_reads_edits_and_searches_notes(pool: PgPool) {
         let relay = start(&pool).await;
-        create_vault(&relay.base, ALICE, "Notes").await;
+        private_vault(&relay.base, ALICE).await;
 
         // No initialize was ever sent: every call stands on its own token.
         assert!(relay
             .ok(ALICE, "list_vaults", json!({}))
             .await
-            .contains("Notes"));
+            .contains("Private"));
         assert_eq!(
             paths(&relay.ok(ALICE, "list_notes", json!({})).await),
             [""; 0]
@@ -1418,7 +1409,7 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn tools_refuse_what_they_should(pool: PgPool) {
         let relay = start(&pool).await;
-        create_vault(&relay.base, ALICE, "Notes").await;
+        private_vault(&relay.base, ALICE).await;
         relay
             .ok(
                 ALICE,
@@ -1481,26 +1472,31 @@ mod tests {
             "1 two 1"
         );
 
-        // With a second vault, the vault has to be named.
-        create_vault(&relay.base, ALICE, "Work").await;
-        let why = relay
-            .refused(ALICE, "read_note", json!({ "path": "a.md" }))
+        // A workspace's vault does not change what no vault named means: it
+        // is still her private vault.
+        workspace_vault(&relay.base, ALICE, "7", "Garden").await;
+        let in_7 = ["7"];
+        let (is_error, text) = relay
+            .call_in(ALICE, &in_7, "read_note", json!({ "path": "a.md" }))
             .await;
-        assert!(why.contains("Notes") && why.contains("Work"), "{why}");
-        relay
-            .ok(
+        assert!(!is_error, "{text}");
+        assert_eq!(text, "1 two 1");
+        let (is_error, _) = relay
+            .call_in(
                 ALICE,
+                &in_7,
                 "read_note",
-                json!({ "vault": "notes", "path": "a.md" }),
+                json!({ "vault": "Garden", "path": "a.md" }),
             )
             .await;
+        assert!(is_error);
     }
 
     #[sqlx::test(migrations = false)]
     async fn tools_never_reach_another_members_notes(pool: PgPool) {
         let relay = start(&pool).await;
-        create_vault(&relay.base, ALICE, "Notes").await;
-        let (_, bobs) = create_vault(&relay.base, BOB, "Notes").await;
+        private_vault(&relay.base, ALICE).await;
+        let (_, bobs) = private_vault(&relay.base, BOB).await;
         relay
             .ok(
                 ALICE,
@@ -1581,7 +1577,7 @@ mod tests {
         use automerge::{transaction::Transactable, ReadDoc};
 
         let relay = start(&pool).await;
-        let (_, vault) = create_vault(&relay.base, ALICE, "Notes").await;
+        let (_, vault) = private_vault(&relay.base, ALICE).await;
         let root: samod::DocumentId = vault["root_doc_id"].as_str().unwrap().parse().unwrap();
 
         // Her device is connected and syncing the vault's root before

@@ -54,8 +54,6 @@ pub struct Orphan {
 
 #[derive(Debug)]
 pub enum FileError {
-    /// Not exactly one private vault to put them in. Holds how many there are.
-    NotOneVault(usize),
     /// The vault's root already has an entry with the folder's name.
     FolderTaken,
     Internal(anyhow::Error),
@@ -70,12 +68,6 @@ impl<E: Into<anyhow::Error>> From<E> for FileError {
 impl std::fmt::Display for FileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FileError::NotOneVault(n) => {
-                write!(
-                    f,
-                    "the member has {n} private vaults; this needs exactly one"
-                )
-            }
             FileError::FolderTaken => write!(f, "the vault already has an entry with that name"),
             FileError::Internal(e) => write!(f, "{e:#}"),
         }
@@ -259,8 +251,8 @@ impl Authz {
         Ok(Some(orphans))
     }
 
-    /// Put these orphans in a new folder at the root of the member's one
-    /// private vault. Returns each linked document with the name it was given.
+    /// Put these orphans in a new folder at the root of the member's private
+    /// vault. Returns each linked document with the name it was given.
     /// Orphans of no linkable kind are left where they are.
     pub async fn file_orphans(
         &self,
@@ -272,15 +264,10 @@ impl Authz {
         if folder.is_empty() {
             return Err(FileError::FolderTaken);
         }
-        let private: Vec<_> = self
-            .vaults_where(did, &[])
-            .await?
-            .into_iter()
-            .filter(|vault| vault.workspace.is_none())
-            .collect();
-        let [vault] = private.as_slice() else {
-            return Err(FileError::NotOneVault(private.len()));
-        };
+        let vault = self
+            .private_vault(did)
+            .await
+            .map_err(|e| anyhow::anyhow!("finding the private vault failed: {e:?}"))?;
         let root = DocumentId::from_str(&vault.root_doc_id)
             .map_err(|e| anyhow::anyhow!("unparseable vault root: {e:?}"))?;
         let root = self
@@ -422,7 +409,7 @@ mod tests {
     async fn a_deleted_note_is_listed_and_filed_back_into_the_vault(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (root, root_doc) = vault(&authz, &repo, &alice).await;
         let note = sent(
             &authz,
             &repo,
@@ -462,7 +449,7 @@ mod tests {
     async fn a_deleted_folder_comes_back_whole(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (root, root_doc) = vault(&authz, &repo, &alice).await;
         let folder = sent(&authz, &repo, &alice, new_folder("Art Projects").unwrap()).await;
         let note = sent(&authz, &repo, &alice, new_note("kiln.md", "glaze").unwrap()).await;
         let note_id = note.document_id().clone();
@@ -498,7 +485,7 @@ mod tests {
     async fn nothing_is_listed_before_every_vault_is_walked(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, _) = vault(&authz, &repo, &alice, "Notes").await;
+        let (root, _) = vault(&authz, &repo, &alice).await;
         sent(&authz, &repo, &alice, new_note("loose.md", "").unwrap()).await;
         walked(&authz).await;
         authz.0.reach.write().unwrap().forget_walk(&root);
@@ -509,7 +496,7 @@ mod tests {
     async fn only_the_members_own_orphans_are_listed(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let (alice, bob) = (did("alice"), did("bob"));
-        let (_, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (_, root_doc) = vault(&authz, &repo, &alice).await;
         let filed = sent(&authz, &repo, &alice, new_note("kept.md", "").unwrap()).await;
         let filed_id = filed.document_id().clone();
         link(&root_doc, "kept.md", "md", &filed_id).await;
@@ -528,7 +515,7 @@ mod tests {
     async fn two_orphans_with_one_name_get_the_plugins_conflict_name(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        vault(&authz, &repo, &alice, "Notes").await;
+        vault(&authz, &repo, &alice).await;
         sent(&authz, &repo, &alice, new_note("a.md", "one").unwrap()).await;
         sent(&authz, &repo, &alice, new_note("A.md", "two").unwrap()).await;
         walked(&authz).await;
@@ -554,21 +541,11 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn nothing_is_written_without_exactly_one_private_vault_or_with_the_name_taken(
-        pool: PgPool,
-    ) {
+    async fn nothing_is_written_when_the_folder_name_is_taken(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
+        let (_, root_doc) = vault(&authz, &repo, &alice).await;
         sent(&authz, &repo, &alice, new_note("loose.md", "").unwrap()).await;
-        walked(&authz).await;
-        let found = orphans(&authz, &alice).await;
-
-        assert!(matches!(
-            authz.file_orphans(&alice, "Recovered", &found).await,
-            Err(FileError::NotOneVault(0))
-        ));
-
-        let (_, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
         let existing = sent(&authz, &repo, &alice, new_folder("Recovered").unwrap()).await;
         let existing = existing.document_id().clone();
         link(&root_doc, "recovered", "folder", &existing).await;
@@ -576,18 +553,34 @@ mod tests {
             authz.vault_of(&existing).is_some()
         })
         .await;
+        walked(&authz).await;
+        let found = orphans(&authz, &alice).await;
+
         assert!(matches!(
             authz.file_orphans(&alice, "Recovered", &found).await,
             Err(FileError::FolderTaken)
         ));
-
-        vault(&authz, &repo, &alice, "Second").await;
-        assert!(matches!(
-            authz.file_orphans(&alice, "Elsewhere", &found).await,
-            Err(FileError::NotOneVault(2))
-        ));
         walked(&authz).await;
         assert_eq!(names(&orphans(&authz, &alice).await), vec!["loose.md"]);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn filing_makes_the_private_vault_if_there_is_none_yet(pool: PgPool) {
+        let (authz, repo) = open(&pool).await;
+        let alice = did("alice");
+        let loose = sent(&authz, &repo, &alice, new_note("loose.md", "").unwrap()).await;
+        let loose = loose.document_id().clone();
+        walked(&authz).await;
+        let found = orphans(&authz, &alice).await;
+        authz
+            .file_orphans(&alice, "Recovered", &found)
+            .await
+            .unwrap();
+        let private = authz.private_vault(&alice).await.unwrap();
+        eventually("the note is in the new vault", || {
+            authz.vault_of(&loose).map(|root| root.to_string()) == Some(private.root_doc_id.clone())
+        })
+        .await;
     }
 
     async fn rows(pool: &PgPool, doc: &DocumentId) -> (i64, i64) {
@@ -612,7 +605,7 @@ mod tests {
     async fn deleting_removes_the_orphans_and_what_they_hold_and_nothing_else(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let (alice, bob) = (did("alice"), did("bob"));
-        let (_, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (_, root_doc) = vault(&authz, &repo, &alice).await;
         let kept = sent(&authz, &repo, &alice, new_note("kept.md", "").unwrap()).await;
         let kept = kept.document_id().clone();
         link(&root_doc, "kept.md", "md", &kept).await;
@@ -650,7 +643,7 @@ mod tests {
     async fn a_document_back_in_a_vault_stops_the_delete(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (_, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (_, root_doc) = vault(&authz, &repo, &alice).await;
         let loose = sent(&authz, &repo, &alice, new_note("loose.md", "").unwrap()).await;
         let loose = loose.document_id().clone();
         walked(&authz).await;
