@@ -90,6 +90,7 @@ On the sync listener (`BIND`):
 | `GET /internal/vaults?did=&workspaces=` | Corliss | A member's vaults, plus those of the comma-separated workspace IDs. `Authorization: Bearer` with the service token. |
 | `POST /internal/vaults` | Corliss | Create a vault: `{"did", "name"}`, or `{"did", "name", "workspace"}` for a workspace's, `did` being the member making it. Returns `201` and the vault. |
 | `PATCH /internal/vaults` | Corliss | Rename a workspace's vault: `{"workspace", "name"}`. Returns `204`, or `404` with `no_vault` when the workspace has none. |
+| `GET /internal/vaults/all` | Corliss | Every vault with the DID that made it, and per creator the documents no vault reaches. For Corliss's admin view. Takes no parameters. `Authorization: Bearer` with the service token. |
 | `GET /.well-known/oauth-protected-resource` | anyone | Which authorization server issues sync tokens: `resource` is `SYNC_AUDIENCE`, `authorization_servers` is the issuer. A sync client given only the sync URL finds Corliss here. Not served with auth off. |
 | `GET /health` | anyone | Liveness and the current auth mode. Does not touch Postgres, so a database blip cannot get the relay restarted out from under live connections. |
 
@@ -176,6 +177,36 @@ folder, and a note stays in a workspace's vault after its author leaves.
 Vaults are created through `POST /internal/vaults` and nowhere else. No sync
 client makes one.
 
+**The admin listing.** `GET /internal/vaults/all` answers:
+
+```json
+{
+  "vaults": [{ "owner_did": "<DID>", "...": "a vault, as above" }],
+  "unfiled": [{ "did": "<DID>", "docs": 3, "bytes": 1234 }]
+}
+```
+
+- **It takes no parameters, on purpose.** The other listings name a member,
+  and a request choosing whose vaults it gets is the thing Corliss guards
+  against. This one has nothing to choose: it is everyone's or a `401`. A
+  query string is ignored rather than read. Who may see the answer is
+  Corliss's question, asked by the admin gate on the one page that calls it.
+- **Counts and sizes, never titles or text.** It walks no folder for names
+  and reads no note. Seeing what members have stored is a different
+  decision from seeing what they wrote.
+- **`owner_did` is here and in no member's listing.** For a workspace's vault
+  it is the member who made it, which the workspace's other members have no
+  need to learn.
+- **`unfiled` is each creator's documents that no vault reaches**, by
+  `doc_creators`: deleted entries, a move cut off part way, a note whose
+  folder never arrived, and entries of a type the relay does not index. With
+  the vaults' `bytes`, it adds up to what each member holds in storage. It is
+  `null` until every vault has been walked since startup, because until then
+  an unwalked vault's notes would be counted as unfiled.
+- **It runs the size query over every vault and every unfiled document.**
+  That is fine at today's size, and it is what to revisit if the admin page
+  gets slow.
+
 ### MCP tools
 
 Every tool acts as the member the token names, in the workspaces it names.
@@ -246,7 +277,9 @@ every range read into a full scan of a table that only grows.
 
 A vault's `bytes` is the one per-vault figure: only the relay's index knows
 which documents a vault holds, so SQL alone cannot split `storage` by vault.
-These answer the rest, in `psql` against the relay's database.
+`GET /internal/vaults/all` gives it for every vault, with each member's
+unfiled documents beside it. These answer the rest, in `psql` against the
+relay's database.
 
 ```sql
 -- The database and the storage table, on disk.
