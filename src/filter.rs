@@ -4,7 +4,7 @@
 //! document and can write to it, and a frame for an unknown ID creates that
 //! document. So the relay does not hand samod the websocket. It hands samod a
 //! transport of its own and stands in the middle, passing each frame in either
-//! direction only if the connection's DID may open the document it names.
+//! direction only if the connection's caller may open the document it names.
 //!
 //! The filter also ends the connection when the token that opened it expires.
 //! samod has no call to close one connection, and a websocket can otherwise
@@ -17,7 +17,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::{channel::mpsc, SinkExt, StreamExt};
 use samod::{AcceptorHandle, Transport};
 
-use crate::auth::Did;
+use crate::auth::Caller;
 use crate::authz::Authz;
 use crate::wire;
 
@@ -29,9 +29,17 @@ const BUFFER: usize = 64;
 /// out". The client reconnects with a fresh one.
 const CLOSE_POLICY: u16 = 1008;
 
+/// How long a request may wait for the index to admit a note another member
+/// has just linked. A walk starts on the folder change and takes well under
+/// this; the rest is slack for a loaded relay.
+const ADMISSION_WAIT: Duration = Duration::from_secs(3);
+
+/// How often a waiting request looks again.
+const ADMISSION_POLL: Duration = Duration::from_millis(100);
+
 pub struct Filter {
     authz: Authz,
-    did: Did,
+    caller: Caller,
 }
 
 #[derive(Debug, PartialEq)]
@@ -45,14 +53,14 @@ pub enum Inbound {
 }
 
 impl Filter {
-    pub fn new(authz: Authz, did: Did) -> Self {
-        Self { authz, did }
+    pub fn new(authz: Authz, caller: Caller) -> Self {
+        Self { authz, caller }
     }
 
     /// Decide what to do with a frame from the peer.
     pub async fn inbound(&self, frame: &[u8]) -> Inbound {
         let Some(envelope) = wire::read(frame) else {
-            tracing::warn!(did = %self.did, "dropping an unreadable frame");
+            tracing::warn!(did = %self.caller.did, "dropping an unreadable frame");
             return Inbound::Drop;
         };
 
@@ -61,16 +69,18 @@ impl Filter {
 
             "request" | "sync" | "ephemeral" | "doc-unavailable" => {
                 let Some(doc) = envelope.document_id else {
-                    tracing::warn!(did = %self.did, kind = %envelope.kind, "dropping a frame with no document ID");
+                    tracing::warn!(did = %self.caller.did, kind = %envelope.kind, "dropping a frame with no document ID");
                     return Inbound::Drop;
                 };
 
                 // A document nobody has sent before belongs to whoever sends
                 // it first. If that cannot be recorded, nobody gets it.
-                let allowed = match self.authz.record_creator(&doc, &self.did).await {
-                    Ok(_) => self.authz.may_open(&self.did, &doc),
+                let allowed = match self.authz.record_creator(&doc, &self.caller).await {
+                    Ok(_) => {
+                        self.authz.may_open(&self.caller, &doc) || self.admitted_soon(&doc).await
+                    }
                     Err(e) => {
-                        tracing::error!(did = %self.did, %doc, error = %e, "could not record a document's creator");
+                        tracing::error!(did = %self.caller.did, %doc, error = %e, "could not record a document's creator");
                         false
                     }
                 };
@@ -92,10 +102,36 @@ impl Filter {
             "remote-subscription-change" | "remote-heads-changed" => Inbound::Drop,
 
             kind => {
-                tracing::warn!(did = %self.did, kind, "dropping a frame of an unexpected type");
+                tracing::warn!(did = %self.caller.did, kind, "dropping a frame of an unexpected type");
                 Inbound::Drop
             }
         }
+    }
+
+    /// Wait a moment for a document another member has just linked into a
+    /// workspace's vault.
+    ///
+    /// Their folder change reaches this peer at once, and the peer asks for
+    /// the new note straight away, before the index has walked the folder. A
+    /// refusal then would stick: the peer would hear "unavailable" from the
+    /// filter, samod would never learn the peer wants the note, and nothing
+    /// would offer it later. So the request is held until the index admits the
+    /// note or [`ADMISSION_WAIT`] passes.
+    ///
+    /// Only a caller in a workspace, asking for someone else's document that
+    /// no vault reaches yet, ever waits. Everything else is answered at once.
+    async fn admitted_soon(&self, doc: &samod::DocumentId) -> bool {
+        if self.caller.workspaces.is_empty() || self.authz.holder_of(doc).is_some() {
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + ADMISSION_WAIT;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(ADMISSION_POLL).await;
+            if self.authz.may_open(&self.caller, doc) {
+                return true;
+            }
+        }
+        false
     }
 
     /// May this frame from samod go to the peer?
@@ -105,14 +141,14 @@ impl Filter {
     /// if that turns out to be wrong.
     pub fn outbound(&self, frame: &[u8]) -> bool {
         let Some(envelope) = wire::read(frame) else {
-            tracing::warn!(did = %self.did, "withholding an unreadable outbound frame");
+            tracing::warn!(did = %self.caller.did, "withholding an unreadable outbound frame");
             return false;
         };
         match envelope.document_id {
             Some(doc) => {
-                let allowed = self.authz.may_open(&self.did, &doc);
+                let allowed = self.authz.may_open(&self.caller, &doc);
                 if !allowed {
-                    tracing::warn!(did = %self.did, %doc, kind = %envelope.kind, "withholding a frame for a document this peer may not open");
+                    tracing::warn!(did = %self.caller.did, %doc, kind = %envelope.kind, "withholding a frame for a document this peer may not open");
                 }
                 allowed
             }
@@ -136,11 +172,14 @@ pub async fn run(
     // half with samod's frames, so they queue for the side that owns it.
     let (mut reply, mut replies) = mpsc::channel::<Vec<u8>>(BUFFER);
 
-    if acceptor.accept(Transport::new(samod_in, samod_out)).is_err() {
-        tracing::warn!(did = %filter.did, "repo stopped; dropping connection");
+    if acceptor
+        .accept(Transport::new(samod_in, samod_out))
+        .is_err()
+    {
+        tracing::warn!(did = %filter.caller.did, "repo stopped; dropping connection");
         return;
     }
-    tracing::info!(did = %filter.did, "peer connected");
+    tracing::info!(did = %filter.caller.did, "peer connected");
 
     // Each direction runs on its own, so a full queue one way never stops the
     // other and the two cannot wait on each other.
@@ -167,7 +206,9 @@ pub async fn run(
         let expired = async {
             match expires_at {
                 Some(at) => {
-                    let left = at.duration_since(SystemTime::now()).unwrap_or(Duration::ZERO);
+                    let left = at
+                        .duration_since(SystemTime::now())
+                        .unwrap_or(Duration::ZERO);
                     tokio::time::sleep(left).await
                 }
                 None => std::future::pending().await,
@@ -178,7 +219,7 @@ pub async fn run(
         loop {
             let frame = tokio::select! {
                 _ = &mut expired => {
-                    tracing::info!(did = %filter.did, "token expired; closing connection");
+                    tracing::info!(did = %filter.caller.did, "token expired; closing connection");
                     let _ = ws_out
                         .send(Message::Close(Some(CloseFrame {
                             code: CLOSE_POLICY,
@@ -209,7 +250,7 @@ pub async fn run(
         _ = inbound => {}
         _ = outbound => {}
     }
-    tracing::info!(did = %filter.did, "peer disconnected");
+    tracing::info!(did = %filter.caller.did, "peer disconnected");
 }
 
 #[cfg(test)]
@@ -219,17 +260,47 @@ mod tests {
     use automerge::Automerge;
     use sqlx::PgPool;
 
-    use crate::authz::tests::{did, open};
+    use crate::auth::Did;
+    use crate::authz::tests::{did, link, member_of, open, sent_by, workspace_vault};
     use crate::wire::tests::{doc_id, frame, CLIENT, RELAY};
+
+    fn as_member(authz: &Authz, did: Did) -> Filter {
+        Filter::new(authz.clone(), did.into())
+    }
 
     fn denied(doc: &samod::DocumentId) -> Inbound {
         Inbound::Deny(wire::doc_unavailable(RELAY, CLIENT, doc))
     }
 
     #[sqlx::test(migrations = false)]
+    async fn a_request_for_a_note_just_linked_into_a_workspace_vault_waits_for_it(pool: PgPool) {
+        let (authz, repo) = open(&pool).await;
+        let (_, root_doc) = workspace_vault(&authz, &repo, "7").await;
+        let bob = Filter::new(authz.clone(), member_of("bob", &["7"]));
+        let dave = Filter::new(authz.clone(), member_of("dave", &["8"]));
+
+        // Alice's note and her folder change land, and Bob asks for the note
+        // before the index has walked the folder.
+        let note = sent_by(&authz, &repo, &member_of("alice", &["7"])).await;
+        link(&root_doc, "plan.md", "md", &note).await;
+        assert_eq!(
+            bob.inbound(&frame("request", Some(&note))).await,
+            Inbound::Pass
+        );
+        assert!(bob.outbound(&frame("sync", Some(&note))));
+
+        // Someone outside the workspace waits out the same moment and is
+        // refused.
+        assert_eq!(
+            dave.inbound(&frame("request", Some(&note))).await,
+            denied(&note)
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn frames_for_a_members_own_document_pass_both_ways(pool: PgPool) {
         let (authz, _repo) = open(&pool).await;
-        let alice = Filter::new(authz.clone(), did("alice"));
+        let alice = as_member(&authz, did("alice"));
         let doc = doc_id(1);
 
         for kind in ["sync", "request", "ephemeral", "doc-unavailable"] {
@@ -241,12 +312,15 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn the_first_sender_of_a_new_document_becomes_its_creator(pool: PgPool) {
         let (authz, _repo) = open(&pool).await;
-        let alice = Filter::new(authz.clone(), did("alice"));
-        let bob = Filter::new(authz.clone(), did("bob"));
+        let alice = as_member(&authz, did("alice"));
+        let bob = as_member(&authz, did("bob"));
         let doc = doc_id(2);
 
         assert_eq!(authz.creator_of(&doc), None);
-        assert_eq!(alice.inbound(&frame("sync", Some(&doc))).await, Inbound::Pass);
+        assert_eq!(
+            alice.inbound(&frame("sync", Some(&doc))).await,
+            Inbound::Pass
+        );
         assert_eq!(authz.creator_of(&doc), Some(did("alice")));
 
         assert_eq!(bob.inbound(&frame("sync", Some(&doc))).await, denied(&doc));
@@ -260,8 +334,8 @@ mod tests {
         let root = vault.root_doc_id.parse().unwrap();
         let note = repo.create(Automerge::new()).await.unwrap();
         let note = note.document_id();
-        authz.record_creator(note, &did("alice")).await.unwrap();
-        let bob = Filter::new(authz.clone(), did("bob"));
+        authz.record(note, &did("alice")).await.unwrap();
+        let bob = as_member(&authz, did("bob"));
 
         for doc in [&root, note] {
             for kind in ["sync", "request", "ephemeral", "doc-unavailable"] {
@@ -274,7 +348,7 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn frames_about_no_document_follow_the_table(pool: PgPool) {
         let (authz, _repo) = open(&pool).await;
-        let alice = Filter::new(authz.clone(), did("alice"));
+        let alice = as_member(&authz, did("alice"));
         let doc = doc_id(3);
 
         for kind in ["join", "leave", "error"] {

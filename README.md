@@ -12,22 +12,29 @@ container.
 ## Status: Phase B
 
 Every connection is authenticated as an SCN member and can open only that
-member's own documents.
+member's own vaults and their workspaces' vaults.
 
 - **Sign-in is Corliss's.** The relay accepts access tokens issued by
   [Corliss](https://github.com/Z-Space-Society/Corliss), the network's OAuth
   provider, and resolves each to the member's DID. Corliss re-checks
   membership every time it issues one and they last 15 minutes, so access
   stops within one token lifetime of leaving the network.
-- **Each vault has one owner.** A vault is a tree of folder and note
-  documents under a root. Only its owner can open them. Sharing is not built.
+- **A vault belongs to one member or one workspace.** A vault is a tree of
+  folder and note documents under a root. A member's own vault opens to them
+  alone. A workspace's vault opens to every member whose token names that
+  workspace. Workspaces are Corliss's: it puts the member's workspace IDs in
+  each token it issues, so the relay holds no roster, and leaving a workspace
+  takes effect within one token lifetime.
 - **MCP is built in.** A second listener serves the member's notes to an MCP
   client, acting as that member, from the same documents sync uses.
 
 What this does not do:
 
-- **It does not unshare the past.** A former member keeps whatever their
-  devices already hold.
+- **It does not unshare the past.** A former member, of the network or of a
+  workspace, keeps whatever their devices already hold.
+- **It is not live co-editing.** Members' edits merge as they sync, the same
+  way one member's devices do. Two people rewriting one sentence at once get
+  both sets of characters interleaved.
 - **It is not end-to-end encrypted.** The relay, and so its operators, can
   read every note. Notes sit in plaintext in Postgres.
 
@@ -79,9 +86,9 @@ On the sync listener (`BIND`):
 | --- | --- | --- |
 | `GET /` | sync client | WebSocket upgrade; the automerge-repo sync protocol. **This is the one clients use**: `WebSocketClientAdapter` connects to exactly the URL it is given and appends no path, so clients are configured with a bare `wss://host`. |
 | `GET /sync` | sync client | The same handler, for a client configured with an explicit path. |
-| `GET /vaults` | member | The caller's vaults. `Authorization: Bearer` with a sync token. |
-| `GET /internal/vaults?did=` | Corliss | A member's vaults. `Authorization: Bearer` with the service token. |
-| `POST /internal/vaults` | Corliss | Create a vault: `{"did", "name"}`. Returns `201` and the vault. |
+| `GET /vaults` | member | The caller's vaults and their token's workspaces' vaults. `Authorization: Bearer` with a sync token. |
+| `GET /internal/vaults?did=&workspaces=` | Corliss | A member's vaults, plus those of the comma-separated workspace IDs. `Authorization: Bearer` with the service token. |
+| `POST /internal/vaults` | Corliss | Create a vault: `{"did", "name"}`, or `{"did", "name", "workspace"}` for a workspace's, `did` being the member making it. Returns `201` and the vault. |
 | `GET /.well-known/oauth-protected-resource` | anyone | Which authorization server issues sync tokens: `resource` is `SYNC_AUDIENCE`, `authorization_servers` is the issuer. A sync client given only the sync URL finds Corliss here. Not served with auth off. |
 | `GET /health` | anyone | Liveness and the current auth mode. Does not touch Postgres, so a database blip cannot get the relay restarted out from under live connections. |
 
@@ -107,6 +114,10 @@ before the upgrade. Once connected:
 
 - A request for a document the member may not open is answered with
   `doc-unavailable`, the same answer a document that does not exist gets.
+- A request from a workspace member for a document someone else has just
+  linked into a vault waits up to 3 seconds for the relay to admit it, rather
+  than being refused while the relay catches up. A refusal would stick until
+  the client reconnected.
 - The relay never offers a document unasked. A client requests the documents
   its folder documents list, on every connection.
 - The connection is closed with code `1008` and reason `token expired` when
@@ -121,6 +132,7 @@ A vault is one JSON object:
   "root_doc_id": "<document ID>",
   "url": "automerge:<document ID>",
   "name": "<vault name>",
+  "workspace": "<workspace ID, or null for a member's private vault>",
   "created_at": "<RFC 3339 timestamp>",
   "last_change_at": "<RFC 3339 timestamp, or null>",
   "note_count": "<integer, or null>",
@@ -135,20 +147,40 @@ the bytes the vault's documents take in storage, which is their Automerge
 history. It grows with every edit and reads larger than the notes as files.
 
 Listings return `{"vaults": [...]}`, oldest first. Errors on the internal
-endpoints are `{"error": "<code>"}`: `400` with `invalid_did` or
-`invalid_name`, `409` with `name_taken`. Names are 1 to 100 characters and
-unique per owner whatever their letter case.
+endpoints are `{"error": "<code>"}`: `400` with `invalid_did`,
+`invalid_name` or `invalid_workspace`, `409` with `name_taken` or
+`workspace_has_vault`. Names are 1 to 100 characters, and a member's own
+vaults' names are unique to them whatever their letter case. A workspace has
+one vault.
+
+In a token, workspaces are the `workspaces` claim:
+`[{"id": "7", "name": "Garden Club"}]`. A token without it is in no
+workspace. An ID is 1 to 64 ASCII letters, digits, `-` and `_`, and is all
+the relay compares. A name is 1 to 100 characters after trimming, and is
+only shown: a workspace's vault is listed to a member under the name their
+token gives the workspace, so a rename in Corliss shows on the next token.
+The name a workspace's vault was created with is what Corliss's own listing
+returns.
+
+**Admission.** A document joins a vault only if the vault admits its
+creator: for a member's vault, the member made it; for a workspace's, its
+creator's token named the workspace when they first sent it. So a member
+cannot pull someone else's document into a vault by writing its URL into a
+folder, and a note stays in a workspace's vault after its author leaves.
 
 Vaults are created through `POST /internal/vaults` and nowhere else. No sync
 client makes one.
 
 ### MCP tools
 
-Every tool acts as the member the token names.
+Every tool acts as the member the token names, in the workspaces it names.
+A tool's `vault` argument is `Private/<name>` or `Workspaces/<name>`, as
+`list_vaults` gives it, or the bare name when only one vault has it. A bare
+name a private vault and a workspace's share is refused rather than guessed.
 
 | Tool | Does |
 | --- | --- |
-| `list_vaults` | The caller's vaults |
+| `list_vaults` | The caller's vaults in two groups, `Private` and `Workspaces` |
 | `list_notes` | Notes and folders in a vault or one of its folders |
 | `read_note` | A note's markdown |
 | `search_notes` | Notes containing every word of a query |
@@ -174,20 +206,28 @@ CREATE TABLE vaults (
   owner_did      TEXT NOT NULL,
   name           TEXT NOT NULL,
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_change_at TIMESTAMPTZ
+  last_change_at TIMESTAMPTZ,
+  workspace_id   TEXT
 );
-CREATE UNIQUE INDEX vaults_owner_name ON vaults (owner_did, lower(name));
+CREATE UNIQUE INDEX vaults_member_name ON vaults (owner_did, lower(name))
+  WHERE workspace_id IS NULL;
+CREATE UNIQUE INDEX vaults_workspace ON vaults (workspace_id)
+  WHERE workspace_id IS NOT NULL;
 
 CREATE TABLE doc_creators (
   doc_id      TEXT PRIMARY KEY,
   creator_did TEXT NOT NULL,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  workspaces  TEXT[] NOT NULL DEFAULT '{}'
 );
 ```
 
-`storage` holds the documents. `vaults` names each vault's owner and root
-document. `doc_creators` records who first sent each document, and is what
-decides ownership: losing it loses every member's access to their own notes,
+`storage` holds the documents. `vaults` names each vault's creator, its
+workspace if it has one, and its root document. A relay before v0.4.0 is
+brought up to this shape at startup: the two columns are added and the old
+`vaults_owner_name` index is replaced. `doc_creators` records who first sent
+each document and the workspaces their token named then, and is what decides
+ownership: losing it loses every member's access to their own notes,
 so it is as much the store of record as `storage` is.
 
 samod's `StorageKey` guarantees no component contains a `/`, so a key round

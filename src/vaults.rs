@@ -1,9 +1,9 @@
 //! The vault endpoints.
 //!
 //! `GET /vaults` is for a member, who presents the same token as for sync and
-//! sees their own vaults. The two `/internal/vaults` endpoints are for Corliss,
-//! which lists and creates vaults on a member's behalf and presents a shared
-//! service credential. The `/internal/` prefix exists so the proxy can leave it
+//! sees their own vaults and their workspaces'. The two `/internal/vaults`
+//! endpoints are for Corliss, which lists and creates vaults on a member's
+//! behalf and presents a shared service credential. The `/internal/` prefix exists so the proxy can leave it
 //! unrouted: it is reachable on the internal network only.
 //!
 //! Vaults are created here and nowhere else. No sync client makes one.
@@ -18,14 +18,16 @@ use serde::Deserialize;
 use serde_json::json;
 use subtle::ConstantTimeEq;
 
-use crate::auth::{is_did, Did};
-use crate::authz::CreateVaultError;
+use crate::auth::{is_did, is_workspace_id, Did};
+use crate::authz::{CreateVaultError, Vault};
 use crate::AppState;
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then_some(token.trim())
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then_some(token.trim())
 }
 
 fn unauthorized() -> Response {
@@ -44,15 +46,13 @@ fn internal_error(e: anyhow::Error) -> Response {
 /// Is this call from Corliss? With no credential configured, nothing is.
 fn is_service(state: &AppState, headers: &HeaderMap) -> bool {
     match (&state.service_token, bearer(headers)) {
-        (Some(expected), Some(presented)) => {
-            presented.as_bytes().ct_eq(expected.as_bytes()).into()
-        }
+        (Some(expected), Some(presented)) => presented.as_bytes().ct_eq(expected.as_bytes()).into(),
         _ => false,
     }
 }
 
-async fn list(state: &AppState, did: &Did) -> Response {
-    let mut vaults = match state.authz.list_vaults(did).await {
+async fn list(state: &AppState, vaults: anyhow::Result<Vec<Vault>>) -> Response {
+    let mut vaults = match vaults {
         Ok(vaults) => vaults,
         Err(e) => return internal_error(e),
     };
@@ -62,7 +62,7 @@ async fn list(state: &AppState, did: &Did) -> Response {
     }
 }
 
-/// `GET /vaults`: the caller's own vaults.
+/// `GET /vaults`: the caller's own vaults and their workspaces'.
 pub async fn list_own(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let verified = match state
         .verifier
@@ -75,15 +75,20 @@ pub async fn list_own(State(state): State<AppState>, headers: HeaderMap) -> Resp
             return unauthorized();
         }
     };
-    list(&state, &verified.did).await
+    let vaults = state.authz.list_vaults(&verified.caller).await;
+    list(&state, vaults).await
 }
 
 #[derive(Deserialize)]
 pub struct ForMember {
     did: String,
+    /// Comma-separated workspace IDs whose vaults to include.
+    #[serde(default)]
+    workspaces: String,
 }
 
-/// `GET /internal/vaults?did=`: a member's vaults, for Corliss.
+/// `GET /internal/vaults?did=&workspaces=`: a member's vaults and those of the
+/// workspaces Corliss names, which it does from its own roster.
 pub async fn list_for_member(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -95,16 +100,29 @@ pub async fn list_for_member(
     if !is_did(&query.did) {
         return error(StatusCode::BAD_REQUEST, "invalid_did");
     }
-    list(&state, &Did(query.did)).await
+    let workspaces: Vec<String> = query
+        .workspaces
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !workspaces.iter().all(|w| is_workspace_id(w)) {
+        return error(StatusCode::BAD_REQUEST, "invalid_workspace");
+    }
+    let vaults = state.authz.vaults_where(&Did(query.did), &workspaces).await;
+    list(&state, vaults).await
 }
 
 #[derive(Deserialize)]
 pub struct NewVault {
     did: String,
     name: String,
+    /// The workspace to hold the vault. Left out, the member holds it.
+    workspace: Option<String>,
 }
 
-/// `POST /internal/vaults`: create a vault for a member, for Corliss.
+/// `POST /internal/vaults`: create a vault for a member or one of their
+/// workspaces, for Corliss.
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -116,10 +134,26 @@ pub async fn create(
     if !is_did(&body.did) {
         return error(StatusCode::BAD_REQUEST, "invalid_did");
     }
-    match state.authz.create_vault(&Did(body.did), &body.name).await {
+    let did = Did(body.did);
+    let created = match body.workspace.as_deref() {
+        Some(workspace) if !is_workspace_id(workspace) => {
+            return error(StatusCode::BAD_REQUEST, "invalid_workspace");
+        }
+        Some(workspace) => {
+            state
+                .authz
+                .create_workspace_vault(&did, workspace, &body.name)
+                .await
+        }
+        None => state.authz.create_vault(&did, &body.name).await,
+    };
+    match created {
         Ok(vault) => (StatusCode::CREATED, Json(vault)).into_response(),
         Err(CreateVaultError::InvalidName) => error(StatusCode::BAD_REQUEST, "invalid_name"),
         Err(CreateVaultError::NameTaken) => error(StatusCode::CONFLICT, "name_taken"),
+        Err(CreateVaultError::WorkspaceHasVault) => {
+            error(StatusCode::CONFLICT, "workspace_has_vault")
+        }
         Err(CreateVaultError::Internal(e)) => internal_error(e),
     }
 }
