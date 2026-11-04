@@ -24,7 +24,7 @@ use samod::{AutomergeUrl, DocHandle, DocumentId};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::auth::Caller;
-use crate::authz::Authz;
+use crate::authz::{Authz, PRIVATE, WORKSPACES};
 use crate::reach::{self, Entry, FOLDER, NOTE};
 
 /// Why a tool could not do what it was asked.
@@ -71,21 +71,6 @@ pub struct Found {
 pub struct Notes<'a> {
     pub authz: &'a Authz,
     pub caller: &'a Caller,
-}
-
-/// The group a member's own vaults are listed under.
-pub const PRIVATE: &str = "Private";
-/// The group workspaces' vaults are listed under.
-pub const WORKSPACES: &str = "Workspaces";
-
-/// A vault's name with its group: `Private/Notes`, `Workspaces/Garden Club`.
-pub fn qualified(vault: &crate::authz::Vault) -> String {
-    let group = if vault.workspace.is_some() {
-        WORKSPACES
-    } else {
-        PRIVATE
-    };
-    format!("{group}/{}", vault.name)
 }
 
 /// Split `Private/<name>` or `Workspaces/<name>`, in any letter case, into
@@ -212,7 +197,7 @@ impl Notes<'_> {
     }
 
     /// Find one of the caller's vaults, or their only vault if none is named.
-    /// Returns its root document and its name as [`qualified`] spells it.
+    /// Returns its root document and its `path`.
     ///
     /// A vault is named `Private/<name>` or `Workspaces/<name>`, matching
     /// `list_vaults`, or by its bare name when only one vault has it. A bare
@@ -250,7 +235,7 @@ impl Notes<'_> {
             None if vaults.len() == 1 => vaults.first(),
             None if vaults.is_empty() => None,
             None => {
-                let names: Vec<_> = vaults.iter().map(qualified).collect();
+                let names: Vec<_> = vaults.iter().map(|vault| vault.path.as_str()).collect();
                 return refuse(format!(
                     "you have more than one vault; name one of: {}",
                     names.join(", ")
@@ -260,7 +245,7 @@ impl Notes<'_> {
         match chosen {
             Some(vault) => Ok((
                 DocumentId::from_str(&vault.root_doc_id).map_err(|e| anyhow::anyhow!("{e:?}"))?,
-                qualified(vault),
+                vault.path.clone(),
             )),
             None => refuse("no vault by that name; list_vaults shows the ones you have"),
         }

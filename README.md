@@ -134,6 +134,7 @@ A vault is one JSON object:
   "url": "automerge:<document ID>",
   "name": "<vault name>",
   "workspace": "<workspace ID, or null for a member's private vault>",
+  "path": "<Private/<name> or Workspaces/<name>>",
   "created_at": "<RFC 3339 timestamp>",
   "last_change_at": "<RFC 3339 timestamp, or null>",
   "note_count": "<integer, or null>",
@@ -153,6 +154,11 @@ endpoints are `{"error": "<code>"}`: `400` with `invalid_did`,
 `workspace_has_vault`. Names are 1 to 100 characters, and a member's own
 vaults' names are unique to them whatever their letter case. A workspace has
 one vault.
+
+`path` is the vault's name under its group, `Private` or `Workspaces`. The
+relay is the only place those words are spelled: MCP names vaults by `path`,
+the Obsidian plugin puts each vault in a folder at its `path`, and Corliss shows
+it. A client builds none of it.
 
 In a token, workspaces are the `workspaces` claim, an array of workspace
 IDs such as `["7", "12"]`. A token without it is in no workspace. An ID is 1
