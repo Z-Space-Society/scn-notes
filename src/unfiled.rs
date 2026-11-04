@@ -45,6 +45,8 @@ pub struct Orphan {
     pub first_line: Option<String>,
     /// For a folder, how many of the member's orphans it holds, at any depth.
     pub inside: usize,
+    /// This document and every one of the member's orphans it holds.
+    pub docs: Vec<DocumentId>,
     /// Bytes in storage, a folder's with everything it holds.
     pub bytes: i64,
     pub created_at: Option<DateTime<Utc>>,
@@ -246,6 +248,7 @@ impl Authz {
                 name: shape.name.clone(),
                 first_line: shape.first_line.clone(),
                 inside: subtree.len() - 1,
+                docs: subtree.clone(),
                 bytes: self.bytes_of(&docs).await?,
                 created_at: created.get(&id.to_string()).copied(),
             });
@@ -336,6 +339,52 @@ impl Authz {
             .await
             .map_err(|_| anyhow::anyhow!("repo stopped"))??;
         Ok(linked)
+    }
+
+    /// Delete these orphans and everything they hold: their stored history
+    /// and their creator rows. Returns how many documents went.
+    ///
+    /// Each one is checked again first: still the member's, and still in no
+    /// vault. One that fails either check stops the whole delete, and nothing
+    /// is removed. The caller stops the repo before this, so nothing it has
+    /// loaded is written back afterwards.
+    pub async fn delete_orphans(&self, did: &Did, orphans: &[Orphan]) -> Result<usize> {
+        let docs: Vec<&DocumentId> = orphans.iter().flat_map(|o| o.docs.iter()).collect();
+        {
+            let reach = self.0.reach.read().unwrap();
+            let creators = self.0.creators.read().unwrap();
+            for doc in &docs {
+                anyhow::ensure!(
+                    creators.get(*doc).map(|c| &c.did) == Some(did),
+                    "{doc} is not the member's; nothing deleted"
+                );
+                anyhow::ensure!(
+                    reach.vault_of(doc).is_none(),
+                    "{doc} is in a vault; nothing deleted"
+                );
+            }
+        }
+        let ids: Vec<String> = docs.iter().map(ToString::to_string).collect();
+        let mut tx = self.0.pool.begin().await?;
+        // The same per-document key range `bytes_of` sums.
+        sqlx::query(
+            "DELETE FROM storage s USING unnest($1::TEXT[]) AS d(id)
+             WHERE s.key ~>=~ (d.id || '/') AND s.key ~<~ (d.id || '0')",
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM doc_creators WHERE doc_id = ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        let mut creators = self.0.creators.write().unwrap();
+        for doc in &docs {
+            creators.remove(*doc);
+        }
+        Ok(docs.len())
     }
 }
 
@@ -539,5 +588,81 @@ mod tests {
         ));
         walked(&authz).await;
         assert_eq!(names(&orphans(&authz, &alice).await), vec!["loose.md"]);
+    }
+
+    async fn rows(pool: &PgPool, doc: &DocumentId) -> (i64, i64) {
+        let id = doc.to_string();
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM storage WHERE key ~>=~ ($1 || '/') AND key ~<~ ($1 || '0')",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let creator: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM doc_creators WHERE doc_id = $1")
+                .bind(&id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (stored, creator)
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn deleting_removes_the_orphans_and_what_they_hold_and_nothing_else(pool: PgPool) {
+        let (authz, repo) = open(&pool).await;
+        let (alice, bob) = (did("alice"), did("bob"));
+        let (_, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let kept = sent(&authz, &repo, &alice, new_note("kept.md", "").unwrap()).await;
+        let kept = kept.document_id().clone();
+        link(&root_doc, "kept.md", "md", &kept).await;
+        let folder = sent(&authz, &repo, &alice, new_folder("Tests").unwrap()).await;
+        let inside = sent(&authz, &repo, &alice, new_note("t.md", "x").unwrap()).await;
+        let inside = inside.document_id().clone();
+        link(&folder, "t.md", "md", &inside).await;
+        let folder = folder.document_id().clone();
+        let loose = sent(&authz, &repo, &alice, new_note("loose.md", "").unwrap()).await;
+        let loose = loose.document_id().clone();
+        let bobs = sent(&authz, &repo, &bob, new_note("bobs.md", "").unwrap()).await;
+        let bobs = bobs.document_id().clone();
+        eventually("the kept note is in the vault", || {
+            authz.vault_of(&kept).is_some()
+        })
+        .await;
+        walked(&authz).await;
+
+        let found = orphans(&authz, &alice).await;
+        assert_eq!(names(&found), vec!["Tests", "loose.md"]);
+        repo.stop().await;
+        assert_eq!(authz.delete_orphans(&alice, &found).await.unwrap(), 3);
+
+        for gone in [&folder, &inside, &loose] {
+            assert_eq!(rows(&pool, gone).await, (0, 0));
+        }
+        for left in [&kept, &bobs] {
+            let (stored, creator) = rows(&pool, left).await;
+            assert!(stored > 0);
+            assert_eq!(creator, 1);
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_document_back_in_a_vault_stops_the_delete(pool: PgPool) {
+        let (authz, repo) = open(&pool).await;
+        let alice = did("alice");
+        let (_, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let loose = sent(&authz, &repo, &alice, new_note("loose.md", "").unwrap()).await;
+        let loose = loose.document_id().clone();
+        walked(&authz).await;
+        let found = orphans(&authz, &alice).await;
+
+        link(&root_doc, "loose.md", "md", &loose).await;
+        eventually("the note is in the vault", || {
+            authz.vault_of(&loose).is_some()
+        })
+        .await;
+        assert!(authz.delete_orphans(&alice, &found).await.is_err());
+        assert_eq!(rows(&pool, &loose).await.1, 1);
+        assert!(authz.delete_orphans(&did("bob"), &found).await.is_err());
     }
 }

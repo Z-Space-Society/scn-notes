@@ -70,9 +70,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("file-unfiled") {
         let (repo, authz) = open_relay(&config).await?;
-        let result = file_unfiled(&authz, &args[1..]).await;
-        repo.stop().await;
-        return result;
+        return file_unfiled(&repo, &authz, &args[1..]).await;
     }
 
     let verifier = build_verifier(&config).await?;
@@ -182,18 +180,39 @@ async fn open_relay(config: &Config) -> Result<(Repo, Authz)> {
 /// How long `file-unfiled` waits for the index to walk every vault.
 const WALK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// `file-unfiled <did> [--folder <name>] [--apply]`: list a member's documents
-/// that no vault reaches, and with `--apply` link them into a new folder at
-/// the root of their private vault.
-async fn file_unfiled(authz: &Authz, args: &[String]) -> Result<()> {
-    const USAGE: &str = "usage: scn-sync-relay file-unfiled <did> [--folder <name>] [--apply]";
+/// `file-unfiled <did> [--folder <name>] [--apply | --delete]`: list a
+/// member's documents that no vault reaches. `--apply` links them into a new
+/// folder at the root of their private vault; `--delete` removes them from
+/// storage. Stops the repo before returning.
+async fn file_unfiled(repo: &Repo, authz: &Authz, args: &[String]) -> Result<()> {
+    let result = run_file_unfiled(authz, args).await;
+    // Stopped before any delete, so nothing the repo loaded is written back
+    // after it.
+    repo.stop().await;
+    if let Some((did, orphans)) = result? {
+        let deleted = authz.delete_orphans(&did, &orphans).await?;
+        println!("Deleted {deleted} documents.");
+    }
+    Ok(())
+}
+
+/// Everything but the delete, which waits for the repo to stop. Returns what
+/// to delete, if that was asked for.
+async fn run_file_unfiled(
+    authz: &Authz,
+    args: &[String],
+) -> Result<Option<(auth::Did, Vec<unfiled::Orphan>)>> {
+    const USAGE: &str =
+        "usage: scn-sync-relay file-unfiled <did> [--folder <name>] [--apply | --delete]";
     let mut did = None;
     let mut folder = "Recovered".to_string();
     let mut apply = false;
+    let mut delete = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--apply" => apply = true,
+            "--delete" => delete = true,
             "--folder" => folder = args.next().context(USAGE)?.clone(),
             other if did.is_none() && auth::is_did(other) => {
                 did = Some(auth::Did(other.to_string()))
@@ -202,6 +221,7 @@ async fn file_unfiled(authz: &Authz, args: &[String]) -> Result<()> {
         }
     }
     let did = did.context(USAGE)?;
+    anyhow::ensure!(!(apply && delete), USAGE);
 
     let started = std::time::Instant::now();
     let orphans = loop {
@@ -233,9 +253,15 @@ async fn file_unfiled(authz: &Authz, args: &[String]) -> Result<()> {
             orphan.first_line.as_deref().unwrap_or(""),
         );
     }
+    if delete {
+        return Ok(Some((did, orphans)));
+    }
     if !apply {
-        println!("Nothing changed. Run again with --apply to put these in {folder:?} in the private vault.");
-        return Ok(());
+        println!(
+            "Nothing changed. Run again with --apply to put these in {folder:?} in the \
+             private vault, or with --delete to remove them."
+        );
+        return Ok(None);
     }
     match authz.file_orphans(&did, &folder, &orphans).await {
         Ok(linked) => {
@@ -246,7 +272,7 @@ async fn file_unfiled(authz: &Authz, args: &[String]) -> Result<()> {
             for (id, name) in linked {
                 println!("  {name}  ({id})");
             }
-            Ok(())
+            Ok(None)
         }
         Err(e) => Err(anyhow::anyhow!("nothing changed: {e}")),
     }
