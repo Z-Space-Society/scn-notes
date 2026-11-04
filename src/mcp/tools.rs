@@ -31,9 +31,8 @@ pub struct NotesServer {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ListNotes {
-    /// Vault, as list_vaults gives it: "Private/<name>" or
-    /// "Workspaces/<name>". The bare name works when only one vault has it.
-    /// May be left out when you have exactly one vault.
+    /// Vault, as list_vaults gives it: "Private" or "Workspaces/<name>".
+    /// A workspace's bare name works too. Left out, your private vault.
     vault: Option<String>,
     /// Folder to list, such as "Projects/2026". Leave out for the top level.
     path: Option<String>,
@@ -43,9 +42,8 @@ pub struct ListNotes {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ReadNote {
-    /// Vault, as list_vaults gives it: "Private/<name>" or
-    /// "Workspaces/<name>". The bare name works when only one vault has it.
-    /// May be left out when you have exactly one vault.
+    /// Vault, as list_vaults gives it: "Private" or "Workspaces/<name>".
+    /// A workspace's bare name works too. Left out, your private vault.
     vault: Option<String>,
     /// Path of the note, such as "Projects/plan.md".
     path: String,
@@ -53,9 +51,8 @@ pub struct ReadNote {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct SearchNotes {
-    /// Vault, as list_vaults gives it: "Private/<name>" or
-    /// "Workspaces/<name>". The bare name works when only one vault has it.
-    /// May be left out when you have exactly one vault.
+    /// Vault, as list_vaults gives it: "Private" or "Workspaces/<name>".
+    /// A workspace's bare name works too. Left out, your private vault.
     vault: Option<String>,
     /// Words to look for. A note matches when it contains all of them, in its
     /// text or its path, in any letter case.
@@ -66,9 +63,8 @@ pub struct SearchNotes {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct CreateNote {
-    /// Vault, as list_vaults gives it: "Private/<name>" or
-    /// "Workspaces/<name>". The bare name works when only one vault has it.
-    /// May be left out when you have exactly one vault.
+    /// Vault, as list_vaults gives it: "Private" or "Workspaces/<name>".
+    /// A workspace's bare name works too. Left out, your private vault.
     vault: Option<String>,
     /// Path for the new note, ending in ".md", such as "Projects/plan.md".
     /// Folders on the way that do not exist are created.
@@ -79,9 +75,8 @@ pub struct CreateNote {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct EditNote {
-    /// Vault, as list_vaults gives it: "Private/<name>" or
-    /// "Workspaces/<name>". The bare name works when only one vault has it.
-    /// May be left out when you have exactly one vault.
+    /// Vault, as list_vaults gives it: "Private" or "Workspaces/<name>".
+    /// A workspace's bare name works too. Left out, your private vault.
     vault: Option<String>,
     /// Path of the note, such as "Projects/plan.md".
     path: String,
@@ -96,9 +91,8 @@ pub struct EditNote {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct AppendNote {
-    /// Vault, as list_vaults gives it: "Private/<name>" or
-    /// "Workspaces/<name>". The bare name works when only one vault has it.
-    /// May be left out when you have exactly one vault.
+    /// Vault, as list_vaults gives it: "Private" or "Workspaces/<name>".
+    /// A workspace's bare name works too. Left out, your private vault.
     vault: Option<String>,
     /// Path of the note, such as "Projects/plan.md".
     path: String,
@@ -149,7 +143,7 @@ impl NotesServer {
     }
 
     #[tool(
-        description = "List your vaults, in two groups. Private vaults are yours alone. Workspaces vaults each belong to a workspace you are in, and every member of it can read and change its notes. Each vault's \"vault\" value is how the other tools name it.",
+        description = "List your vaults, in two groups. Your private vault is yours alone; tools use it when no vault is named. Workspaces vaults each belong to a workspace you are in, and every member of it can read and change its notes. Each vault's \"vault\" value is how the other tools name it.",
         annotations(title = "List vaults", read_only_hint = true)
     )]
     async fn list_vaults(

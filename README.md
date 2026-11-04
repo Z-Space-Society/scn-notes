@@ -86,10 +86,9 @@ On the sync listener (`BIND`):
 | --- | --- | --- |
 | `GET /` | sync client | WebSocket upgrade; the automerge-repo sync protocol. **This is the one clients use**: `WebSocketClientAdapter` connects to exactly the URL it is given and appends no path, so clients are configured with a bare `wss://host`. |
 | `GET /sync` | sync client | The same handler, for a client configured with an explicit path. |
-| `GET /vaults` | member | The caller's vaults and their token's workspaces' vaults. `Authorization: Bearer` with a sync token. |
-| `GET /internal/vaults?did=&workspaces=` | Corliss | A member's vaults, plus those of the comma-separated workspace IDs. `Authorization: Bearer` with the service token. |
-| `POST /internal/vaults` | Corliss | Create a vault: `{"did", "name"}`, or `{"did", "name", "workspace"}` for a workspace's, `did` being the member making it. Returns `201` and the vault. |
-| `PATCH /internal/vaults` | Corliss | Rename a workspace's vault: `{"workspace", "name"}`. Returns `204`, or `404` with `no_vault` when the workspace has none. |
+| `GET /vaults` | member | The caller's private vault and their token's workspaces' vaults. Makes the private vault if they have none yet. `Authorization: Bearer` with a sync token. |
+| `GET /internal/vaults?did=&workspaces=` | Corliss | A member's private vault, plus the vaults of the comma-separated workspace IDs. Makes the private vault if they have none yet. `Authorization: Bearer` with the service token. |
+| `PUT /internal/vaults/workspace` | Corliss | A workspace's vault: `{"did", "workspace", "name"}`, `did` being the member asking. Made if the workspace has none, and given `name` either way, so the same call serves the workspace's page, its creation and its rename. Returns `200` and the vault. |
 | `GET /internal/vaults/all` | Corliss | Every vault with the DID that made it, and per creator the documents no vault reaches. For Corliss's admin view. Takes no parameters. `Authorization: Bearer` with the service token. |
 | `GET /.well-known/oauth-protected-resource` | anyone | Which authorization server issues sync tokens: `resource` is `SYNC_AUDIENCE`, `authorization_servers` is the issuer. A sync client given only the sync URL finds Corliss here. Not served with auth off. |
 | `GET /health` | anyone | Liveness and the current auth mode. Does not touch Postgres, so a database blip cannot get the relay restarted out from under live connections. |
@@ -133,9 +132,9 @@ A vault is one JSON object:
 {
   "root_doc_id": "<document ID>",
   "url": "automerge:<document ID>",
-  "name": "<vault name>",
+  "name": "<the workspace's name, or null for a member's private vault>",
   "workspace": "<workspace ID, or null for a member's private vault>",
-  "path": "<Private/<name> or Workspaces/<name>>",
+  "path": "<Private, or Workspaces/<name>>",
   "created_at": "<RFC 3339 timestamp>",
   "last_change_at": "<RFC 3339 timestamp, or null>",
   "note_count": "<integer, or null>",
@@ -151,12 +150,11 @@ history. It grows with every edit and reads larger than the notes as files.
 
 Listings return `{"vaults": [...]}`, oldest first. Errors on the internal
 endpoints are `{"error": "<code>"}`: `400` with `invalid_did`,
-`invalid_name` or `invalid_workspace`, `409` with `name_taken` or
-`workspace_has_vault`. Names are 1 to 100 characters, and a member's own
-vaults' names are unique to them whatever their letter case. A workspace has
-one vault.
+`invalid_name` or `invalid_workspace`. A member has one private vault, which
+has no name. A workspace has one vault, named 1 to 100 characters.
 
-`path` is the vault's name under its group, `Private` or `Workspaces`. The
+`path` is `Private` for a member's private vault, and the name under
+`Workspaces` for a workspace's. The
 relay is the only place those words are spelled: MCP names vaults by `path`,
 the Obsidian plugin puts each vault in a folder at its `path`, and Corliss shows
 it. A client builds none of it.
@@ -165,8 +163,8 @@ In a token, workspaces are the `workspaces` claim, an array of workspace
 IDs such as `["7", "12"]`. A token without it is in no workspace. An ID is 1
 to 64 ASCII letters, digits, `-` and `_`, and is opaque on purpose: a sync
 client sends its token in a websocket URL, so the token names no workspace in
-words. A workspace's vault carries the workspace's name, and Corliss renames
-it with `PATCH /internal/vaults` when the workspace is renamed.
+words. A workspace's vault carries the workspace's name, which Corliss sends
+with every `PUT /internal/vaults/workspace`, a rename included.
 
 **Admission.** A document joins a vault only if the vault admits its
 creator: for a member's vault, the member made it; for a workspace's, its
@@ -174,8 +172,14 @@ creator's token named the workspace when they first sent it. So a member
 cannot pull someone else's document into a vault by writing its URL into a
 folder, and a note stays in a workspace's vault after its author leaves.
 
-Vaults are created through `POST /internal/vaults` and nowhere else. No sync
-client makes one.
+Vaults are made by the relay and nowhere else: a member's private vault the
+first time any listing asks for it, a workspace's the first time Corliss asks
+for it. The relay sees workspace IDs only, never names, which is why a
+workspace's vault waits for Corliss. No sync client makes one.
+
+From v0.5.0 a member has one private vault. At startup the relay clears the
+names private vaults carried before, and makes one unique per member. If a
+member has two, startup fails rather than merge them silently.
 
 **The admin listing.** `GET /internal/vaults/all` answers:
 
@@ -225,16 +229,16 @@ checking again that each is still the member's and in no vault.
   with its notes inside it, and its notes are not filed a second time. Two
   entries with one name get the plugin's conflict name. Documents that are
   neither notes nor folders are listed and left where they are.
-- **It refuses rather than guesses**: when the member does not have exactly
-  one private vault, or the vault already has an entry with the folder's
-  name.
+- **It refuses rather than guesses** when the vault already has an entry
+  with the folder's name.
 
 ### MCP tools
 
 Every tool acts as the member the token names, in the workspaces it names.
-A tool's `vault` argument is `Private/<name>` or `Workspaces/<name>`, as
-`list_vaults` gives it, or the bare name when only one vault has it. A bare
-name a private vault and a workspace's share is refused rather than guessed.
+A tool's `vault` argument is `Private` or `Workspaces/<name>`, as
+`list_vaults` gives it, or a workspace's bare name. Left out, it is the
+caller's private vault, which every member has. Two workspaces sharing a name
+are refused rather than guessed between.
 
 | Tool | Does |
 | --- | --- |

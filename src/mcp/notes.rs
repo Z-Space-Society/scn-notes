@@ -199,50 +199,48 @@ impl Notes<'_> {
         }
     }
 
-    /// Find one of the caller's vaults, or their only vault if none is named.
-    /// Returns its root document and its `path`.
+    /// Find one of the caller's vaults. Returns its root document and its
+    /// `path`.
     ///
-    /// A vault is named `Private/<name>` or `Workspaces/<name>`, matching
-    /// `list_vaults`, or by its bare name when only one vault has it. A bare
-    /// name two vaults share is refused rather than guessed at, since a write
-    /// to the wrong one would land where other members can read it, or fail
-    /// to.
+    /// Left out, or named `Private`, it is the caller's private vault, which
+    /// every member has. A workspace's vault is `Workspaces/<name>`, matching
+    /// `list_vaults`, or its bare name. Two workspaces sharing a name are
+    /// refused rather than guessed between, since a write to the wrong one
+    /// would land where other members can read it.
     pub async fn vault(&self, name: Option<&str>) -> Result<(DocumentId, String)> {
         let vaults = self.authz.list_vaults(self.caller).await?;
-        let chosen = match name.map(str::trim).filter(|name| !name.is_empty()) {
+        let wanted = name.map(str::trim).filter(|name| !name.is_empty());
+        let chosen = match wanted {
+            None => vaults.iter().find(|vault| vault.workspace.is_none()),
+            Some(wanted) if key(wanted) == key(PRIVATE) => {
+                vaults.iter().find(|vault| vault.workspace.is_none())
+            }
             Some(wanted) => {
-                let (group, bare) = match split_group(wanted) {
-                    Some((shared, bare)) => (Some(shared), bare),
-                    None => (None, wanted),
+                let bare = match split_group(wanted) {
+                    Some((true, bare)) => bare,
+                    Some((false, _)) => {
+                        return refuse(format!(
+                            "your private vault is {PRIVATE:?}; it has no name after it"
+                        ));
+                    }
+                    None => wanted,
                 };
                 let mut named = vaults.iter().filter(|vault| {
-                    key(&vault.name) == key(bare)
-                        && group.is_none_or(|shared| vault.workspace.is_some() == shared)
+                    vault.workspace.is_some()
+                        && vault
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| key(name) == key(bare))
                 });
                 let first = named.next();
                 if named.next().is_some() {
-                    return refuse(match group {
-                        None => format!(
-                            "more than one vault is named {bare:?}; say {:?} or {:?}",
-                            format!("{PRIVATE}/{bare}"),
-                            format!("{WORKSPACES}/{bare}"),
-                        ),
-                        Some(_) => format!(
-                            "more than one vault is named {wanted:?}; two workspaces share that \
-                             name, and one of them needs renaming in Corliss"
-                        ),
-                    });
+                    return refuse(format!(
+                        "more than one vault is named {:?}; two workspaces share that name, \
+                         and one of them needs renaming in Corliss",
+                        format!("{WORKSPACES}/{bare}")
+                    ));
                 }
                 first
-            }
-            None if vaults.len() == 1 => vaults.first(),
-            None if vaults.is_empty() => None,
-            None => {
-                let names: Vec<_> = vaults.iter().map(|vault| vault.path.as_str()).collect();
-                return refuse(format!(
-                    "you have more than one vault; name one of: {}",
-                    names.join(", ")
-                ));
             }
         };
         match chosen {

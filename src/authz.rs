@@ -26,7 +26,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use samod::{AutomergeUrl, DocumentId, Repo};
+use samod::{DocumentId, Repo};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 
@@ -86,23 +86,23 @@ impl std::fmt::Display for Holder {
     }
 }
 
-/// The group a member's private vaults are listed under.
+/// A member's private vault's path: the group alone, since a member has one.
 pub const PRIVATE: &str = "Private";
 /// The group workspaces' vaults are listed under.
 pub const WORKSPACES: &str = "Workspaces";
 
-/// A vault's name with its group: `Private/Notes`, `Workspaces/Garden Club`.
+/// A vault's path: `Private` for a member's one private vault, which has no
+/// name, and the name under its group for a workspace's, `Workspaces/Garden
+/// Club`.
 ///
 /// The one place these words are spelled. Every listing carries the result as
 /// `path`, so MCP, the Obsidian plugin's folders and Corliss's pages all show
 /// what this says rather than each building it.
-pub fn path_of(name: &str, workspace: Option<&str>) -> String {
-    let group = if workspace.is_some() {
-        WORKSPACES
-    } else {
-        PRIVATE
-    };
-    format!("{group}/{name}")
+pub fn path_of(name: Option<&str>, workspace: Option<&str>) -> String {
+    match workspace {
+        Some(_) => format!("{WORKSPACES}/{}", name.unwrap_or_default()),
+        None => PRIVATE.to_string(),
+    }
 }
 
 /// A vault as the endpoints return it.
@@ -110,7 +110,9 @@ pub fn path_of(name: &str, workspace: Option<&str>) -> String {
 pub struct Vault {
     pub root_doc_id: String,
     pub url: String,
-    pub name: String,
+    /// The workspace's name for its vault. Null for a member's private vault,
+    /// which has none of its own.
+    pub name: Option<String>,
     /// The workspace that holds the vault, or null for a member's own.
     pub workspace: Option<String>,
     /// The name with its group, from [`path_of`]: how MCP names the vault and
@@ -151,13 +153,18 @@ fn vault_from(row: &sqlx::postgres::PgRow, reach: &reach::Index) -> Result<Vault
     let id = DocumentId::from_str(&root).ok();
     // Memory is ahead of the table by up to a minute.
     let in_memory = id.as_ref().and_then(|id| reach.last_change(id));
-    let name: String = row.try_get("name")?;
     let workspace: Option<String> = row.try_get("workspace_id")?;
+    // A private row written before v0.5.0 may still carry its old name until
+    // the startup statements clear it; it is never shown.
+    let name: Option<String> = match workspace {
+        Some(_) => row.try_get("name")?,
+        None => None,
+    };
     Ok(Vault {
         url: format!("automerge:{root}"),
         note_count: id.as_ref().and_then(|id| reach.note_count(id)),
         root_doc_id: root,
-        path: path_of(&name, workspace.as_deref()),
+        path: path_of(name.as_deref(), workspace.as_deref()),
         name,
         workspace,
         created_at: row.try_get("created_at")?,
@@ -168,12 +175,8 @@ fn vault_from(row: &sqlx::postgres::PgRow, reach: &reach::Index) -> Result<Vault
 
 #[derive(Debug)]
 pub enum CreateVaultError {
-    /// The name is empty or too long once trimmed.
+    /// A workspace's vault name that is empty or too long once trimmed.
     InvalidName,
-    /// This owner already has a vault with that name, in any letter case.
-    NameTaken,
-    /// This workspace already has its vault. A workspace has one.
-    WorkspaceHasVault,
     Internal(anyhow::Error),
 }
 
@@ -318,34 +321,24 @@ impl Authz {
         self.vaults_where(&caller.did, &caller.workspaces).await
     }
 
-    /// Rename a workspace's vault. Corliss calls this when the workspace is
-    /// renamed, since a workspace's vault carries its name. Returns false when
-    /// the workspace has no vault.
-    ///
-    /// Only the listing changes. The root folder's own `title` is left alone:
-    /// no client reads it, and rewriting it would be an edit every member
-    /// syncs.
-    pub async fn rename_workspace_vault(
-        &self,
-        workspace: &str,
-        name: &str,
-    ) -> Result<bool, CreateVaultError> {
-        let name = name.trim();
-        if name.is_empty() || name.chars().count() > MAX_VAULT_NAME {
-            return Err(CreateVaultError::InvalidName);
-        }
-        let renamed = sqlx::query("UPDATE vaults SET name = $1 WHERE workspace_id = $2")
-            .bind(name)
-            .bind(workspace)
-            .execute(&self.0.pool)
-            .await?;
-        Ok(renamed.rows_affected() > 0)
-    }
-
     /// The vaults a member holds plus those of the named workspaces. Corliss
     /// names the workspaces itself; a sync or MCP caller's come from their
     /// token, through [`Authz::list_vaults`].
+    ///
+    /// The member's private vault is made here when they have none yet, so
+    /// whoever asks first, the Obsidian plugin, MCP or Corliss, finds it.
     pub async fn vaults_where(&self, owner: &Did, workspaces: &[String]) -> Result<Vec<Vault>> {
+        let mut vaults = self.listed(owner, workspaces).await?;
+        if !vaults.iter().any(|vault| vault.workspace.is_none()) {
+            self.private_vault(owner)
+                .await
+                .map_err(|e| anyhow::anyhow!("making the private vault failed: {e:?}"))?;
+            vaults = self.listed(owner, workspaces).await?;
+        }
+        Ok(vaults)
+    }
+
+    async fn listed(&self, owner: &Did, workspaces: &[String]) -> Result<Vec<Vault>> {
         let rows = sqlx::query(
             "SELECT root_doc_id, name, workspace_id, created_at, last_change_at FROM vaults
              WHERE (owner_did = $1 AND workspace_id IS NULL) OR workspace_id = ANY($2)
@@ -449,119 +442,122 @@ impl Authz {
         .await?)
     }
 
-    /// Create a vault for a member: an empty root folder document and its row.
+    /// The member's private vault, made now if they have none. A member has
+    /// one.
     ///
-    /// Membership is not checked. The caller is Corliss, acting for a member
-    /// who is signed in, and a vault whose owner cannot get a token is
-    /// unreachable anyway.
-    pub async fn create_vault(&self, owner: &Did, name: &str) -> Result<Vault, CreateVaultError> {
-        self.create(owner, None, name).await
+    /// Membership is not checked. The caller is Corliss acting for a signed-in
+    /// member, or the member's own token, and a vault whose owner cannot get a
+    /// token is unreachable anyway.
+    pub async fn private_vault(&self, owner: &Did) -> Result<Vault, CreateVaultError> {
+        self.find_or_create(owner, None).await
     }
 
-    /// Create a workspace's vault, made by one of its members. A workspace
-    /// has one vault.
+    /// The workspace's vault, made now by `creator` if it has none, and
+    /// carrying `name`, the workspace's name in Corliss, either way. A
+    /// workspace has one vault.
     ///
     /// Membership of the workspace is not checked either: Corliss holds the
-    /// roster and asks only for a member of it.
-    pub async fn create_workspace_vault(
+    /// roster and asks only for a member of it. Only the listing's name
+    /// changes on a rename. The root folder's own `title` is left alone: no
+    /// client reads it, and rewriting it would be an edit every member syncs.
+    pub async fn workspace_vault(
         &self,
         creator: &Did,
         workspace: &str,
-        name: &str,
-    ) -> Result<Vault, CreateVaultError> {
-        self.create(creator, Some(workspace), name).await
-    }
-
-    async fn create(
-        &self,
-        owner: &Did,
-        workspace: Option<&str>,
         name: &str,
     ) -> Result<Vault, CreateVaultError> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > MAX_VAULT_NAME {
             return Err(CreateVaultError::InvalidName);
         }
+        sqlx::query(
+            "UPDATE vaults SET name = $1 WHERE workspace_id = $2 AND name IS DISTINCT FROM $1",
+        )
+        .bind(name)
+        .bind(workspace)
+        .execute(&self.0.pool)
+        .await?;
+        self.find_or_create(creator, Some((workspace, name))).await
+    }
 
-        // Asked first so the ordinary duplicate leaves no document behind. The
-        // unique indexes below are what make it true under a race.
-        let taken = match workspace {
-            Some(workspace) => sqlx::query("SELECT 1 FROM vaults WHERE workspace_id = $1")
+    /// The vault's row as a [`Vault`], if there is one.
+    async fn find(&self, owner: &Did, workspace: Option<&str>) -> Result<Option<Vault>> {
+        let row = match workspace {
+            Some(workspace) => {
+                sqlx::query(
+                    "SELECT root_doc_id, name, workspace_id, created_at, last_change_at
+                     FROM vaults WHERE workspace_id = $1",
+                )
                 .bind(workspace)
                 .fetch_optional(&self.0.pool)
                 .await?
-                .map(|_| CreateVaultError::WorkspaceHasVault),
-            None => sqlx::query(
-                "SELECT 1 FROM vaults
-                 WHERE owner_did = $1 AND workspace_id IS NULL AND lower(name) = lower($2)",
-            )
-            .bind(&owner.0)
-            .bind(name)
-            .fetch_optional(&self.0.pool)
-            .await?
-            .map(|_| CreateVaultError::NameTaken),
+            }
+            None => {
+                sqlx::query(
+                    "SELECT root_doc_id, name, workspace_id, created_at, last_change_at
+                     FROM vaults WHERE owner_did = $1 AND workspace_id IS NULL",
+                )
+                .bind(&owner.0)
+                .fetch_optional(&self.0.pool)
+                .await?
+            }
         };
-        if let Some(taken) = taken {
-            return Err(taken);
+        let reach = self.0.reach.read().unwrap();
+        row.map(|row| vault_from(&row, &reach)).transpose()
+    }
+
+    /// Find the vault, or make it: an empty root folder document and its row.
+    async fn find_or_create(
+        &self,
+        owner: &Did,
+        workspace: Option<(&str, &str)>,
+    ) -> Result<Vault, CreateVaultError> {
+        let id = workspace.map(|(id, _)| id);
+        // Asked first so the ordinary case leaves no document behind. The
+        // unique indexes below are what make it true under a race.
+        if let Some(vault) = self.find(owner, id).await? {
+            return Ok(vault);
         }
 
+        let title = workspace.map_or(PRIVATE, |(_, name)| name);
         let handle = self
             .0
             .repo
-            .create(reach::new_folder(name)?)
+            .create(reach::new_folder(title)?)
             .await
             .map_err(|_| anyhow::anyhow!("repo stopped"))?;
         let root = handle.document_id().clone();
         // The root is the vault's own from the start, whatever this row says,
         // so the creator recorded here only matters if the insert below fails.
-        let creator = Caller::in_workspaces(
-            owner.clone(),
-            workspace.map(str::to_string).into_iter().collect(),
-        );
+        let creator =
+            Caller::in_workspaces(owner.clone(), id.map(str::to_string).into_iter().collect());
         self.record_creator(&root, &creator).await?;
 
         let inserted = sqlx::query(
             "INSERT INTO vaults (root_doc_id, owner_did, workspace_id, name)
-             VALUES ($1, $2, $3, $4)
-             RETURNING created_at",
+             VALUES ($1, $2, $3, $4)",
         )
         .bind(root.to_string())
         .bind(&owner.0)
-        .bind(workspace)
-        .bind(name)
-        .fetch_one(&self.0.pool)
+        .bind(id)
+        .bind(workspace.map(|(_, name)| name))
+        .execute(&self.0.pool)
         .await;
-        let created_at = match inserted {
-            Ok(row) => row.try_get("created_at")?,
-            // Lost a race. The root document stays behind, open only to its
-            // creator and linked from nowhere.
-            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-                return Err(match workspace {
-                    Some(_) => CreateVaultError::WorkspaceHasVault,
-                    None => CreateVaultError::NameTaken,
-                });
-            }
+        match inserted {
+            Ok(_) => self.start_vault(
+                root,
+                Holder::of(owner.clone(), id.map(str::to_string)),
+                None,
+            ),
+            // Lost a race to another request making the same vault. The root
+            // document stays behind, open only to its creator and linked from
+            // nowhere, and the winner's vault is the answer.
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {}
             Err(e) => return Err(e.into()),
-        };
-
-        let workspace = workspace.map(str::to_string);
-        self.start_vault(
-            root.clone(),
-            Holder::of(owner.clone(), workspace.clone()),
-            None,
-        );
-
-        Ok(Vault {
-            url: AutomergeUrl::from(&root).to_string(),
-            root_doc_id: root.to_string(),
-            path: path_of(name, workspace.as_deref()),
-            name: name.to_string(),
-            workspace,
-            created_at,
-            last_change_at: None,
-            note_count: None,
-            bytes: None,
-        })
+        }
+        self.find(owner, id)
+            .await?
+            .ok_or_else(|| CreateVaultError::Internal(anyhow::anyhow!("the vault's row is gone")))
     }
 }
 
@@ -578,14 +574,19 @@ async fn migrate(pool: &PgPool) -> Result<(), sqlx::Error> {
          )",
         // Null for a member's own vault.
         "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS workspace_id TEXT",
-        // Up to v0.3.0 this index covered every row. Replaced by the partial
-        // one below, since a workspace vault's name is not its creator's.
+        // Up to v0.3.0 this index covered every row, and up to v0.4.4 the one
+        // after it allowed a member many private vaults, one per name.
         "DROP INDEX IF EXISTS vaults_owner_name",
-        // One name per owner whatever its letter case among their own vaults:
-        // tools address a note by vault name and path. Also serves the lookup
-        // by owner.
-        "CREATE UNIQUE INDEX IF NOT EXISTS vaults_member_name
-             ON vaults (owner_did, lower(name)) WHERE workspace_id IS NULL",
+        "DROP INDEX IF EXISTS vaults_member_name",
+        // From v0.5.0 a member's private vault has no name: its path is
+        // `Private`. A workspace's vault keeps the workspace's name.
+        "ALTER TABLE vaults ALTER COLUMN name DROP NOT NULL",
+        "UPDATE vaults SET name = NULL WHERE workspace_id IS NULL AND name IS NOT NULL",
+        // One private vault per member. Fails, and so stops startup, if a
+        // member has two: merging them is not something to do silently. Also
+        // serves the lookup by owner.
+        "CREATE UNIQUE INDEX IF NOT EXISTS vaults_member
+             ON vaults (owner_did) WHERE workspace_id IS NULL",
         // One vault per workspace. Also serves the lookup by workspace.
         "CREATE UNIQUE INDEX IF NOT EXISTS vaults_workspace
              ON vaults (workspace_id) WHERE workspace_id IS NOT NULL",
@@ -612,7 +613,7 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     use automerge::{transaction::Transactable, Automerge, ReadDoc, ROOT};
-    use samod::DocHandle;
+    use samod::{AutomergeUrl, DocHandle};
 
     use crate::reach::{add_entry, new_folder, Entry};
     use crate::storage::PostgresStorage;
@@ -705,13 +706,9 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    pub async fn vault(
-        authz: &Authz,
-        repo: &Repo,
-        owner: &Did,
-        name: &str,
-    ) -> (DocumentId, DocHandle) {
-        let vault = authz.create_vault(owner, name).await.unwrap();
+    /// The member's private vault: its root and a handle on it.
+    pub async fn vault(authz: &Authz, repo: &Repo, owner: &Did) -> (DocumentId, DocHandle) {
+        let vault = authz.private_vault(owner).await.unwrap();
         let root = DocumentId::from_str(&vault.root_doc_id).unwrap();
         let handle = repo.find(root.clone()).await.unwrap().unwrap();
         (root, handle)
@@ -720,7 +717,7 @@ pub(crate) mod tests {
     #[sqlx::test(migrations = false)]
     async fn a_vault_root_is_open_to_its_owner_only(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        let (root, _) = vault(&authz, &repo, &did("alice"), "Notes").await;
+        let (root, _) = vault(&authz, &repo, &did("alice")).await;
 
         assert!(authz.opens(&did("alice"), &root));
         assert!(!authz.opens(&did("bob"), &root));
@@ -759,7 +756,7 @@ pub(crate) mod tests {
     async fn linked_notes_and_nested_folders_join_the_vault(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (root, root_doc) = vault(&authz, &repo, &alice).await;
 
         let folder = sent(&authz, &repo, &alice, new_folder("Projects").unwrap()).await;
         let note = sent(&authz, &repo, &alice, Automerge::new()).await;
@@ -780,7 +777,7 @@ pub(crate) mod tests {
     async fn a_link_to_someone_elses_document_is_ignored(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let (alice, bob) = (did("alice"), did("bob"));
-        let (root, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (root, root_doc) = vault(&authz, &repo, &alice).await;
 
         let theirs = sent(&authz, &repo, &bob, Automerge::new()).await;
         let mine = sent(&authz, &repo, &alice, Automerge::new()).await;
@@ -802,7 +799,7 @@ pub(crate) mod tests {
     async fn a_link_that_arrives_before_the_note_waits_for_its_creator(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (root, root_doc) = vault(&authz, &repo, &alice).await;
 
         // Stored, but nobody is recorded as having sent it yet.
         let note = repo.create(Automerge::new()).await.unwrap();
@@ -830,7 +827,7 @@ pub(crate) mod tests {
     async fn a_note_survives_a_move_and_outlives_its_last_entry(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (root, root_doc) = vault(&authz, &repo, &alice).await;
 
         let folder = sent(&authz, &repo, &alice, new_folder("Archive").unwrap()).await;
         let note = sent(&authz, &repo, &alice, Automerge::new()).await;
@@ -862,7 +859,7 @@ pub(crate) mod tests {
     async fn entries_of_other_types_are_left_alone(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (root, root_doc) = vault(&authz, &repo, &alice).await;
 
         let canvas = sent(&authz, &repo, &alice, Automerge::new()).await;
         let note = sent(&authz, &repo, &alice, Automerge::new()).await;
@@ -881,7 +878,7 @@ pub(crate) mod tests {
     async fn a_change_in_the_vault_sets_its_last_change(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (_, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (_, root_doc) = vault(&authz, &repo, &alice).await;
         assert!(authz.vaults_of(&alice).await.unwrap()[0]
             .last_change_at
             .is_none());
@@ -905,7 +902,7 @@ pub(crate) mod tests {
     async fn a_walked_vault_has_a_note_count_and_a_size(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (root, root_doc) = vault(&authz, &repo, &alice).await;
 
         let mut notes = Vec::new();
         for name in ["a.md", "b.md"] {
@@ -947,7 +944,7 @@ pub(crate) mod tests {
     async fn documents_no_vault_reaches_are_counted_per_creator(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let (alice, bob) = (did("alice"), did("bob"));
-        let (root, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+        let (root, root_doc) = vault(&authz, &repo, &alice).await;
 
         let filed = sent(&authz, &repo, &alice, Automerge::new()).await;
         link(&root_doc, "a.md", "md", filed.document_id()).await;
@@ -986,7 +983,7 @@ pub(crate) mod tests {
     #[sqlx::test(migrations = false)]
     async fn unfiled_is_unknown_until_every_vault_is_walked(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        let (root, _) = vault(&authz, &repo, &did("alice"), "Notes").await;
+        let (root, _) = vault(&authz, &repo, &did("alice")).await;
         // Let the first walk finish so it cannot land after the line below.
         eventually("the vault is walked", || authz.all_walked()).await;
         assert!(authz.unfiled().await.unwrap().is_some());
@@ -997,30 +994,55 @@ pub(crate) mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn vault_names_are_unique_per_owner_whatever_the_case(pool: PgPool) {
+    async fn a_member_has_one_private_vault_with_no_name_made_when_first_listed(pool: PgPool) {
         let (authz, _repo) = open(&pool).await;
         let alice = did("alice");
-        authz.create_vault(&alice, "  Notes ").await.unwrap();
 
-        let again = authz.create_vault(&alice, "notes").await;
-        assert!(matches!(again, Err(CreateVaultError::NameTaken)));
-        authz.create_vault(&did("bob"), "Notes").await.unwrap();
-        authz.create_vault(&alice, "Work").await.unwrap();
+        let listed = authz.vaults_of(&alice).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, None);
+        assert_eq!(listed[0].workspace, None);
+        assert_eq!(listed[0].path, "Private");
 
-        let names: Vec<_> = authz
-            .vaults_of(&alice)
+        // Asked again, every way, it is the same vault.
+        assert_eq!(
+            authz.vaults_of(&alice).await.unwrap()[0].root_doc_id,
+            listed[0].root_doc_id
+        );
+        assert_eq!(
+            authz.private_vault(&alice).await.unwrap().root_doc_id,
+            listed[0].root_doc_id
+        );
+        let bobs = authz.private_vault(&did("bob")).await.unwrap();
+        assert_ne!(bobs.root_doc_id, listed[0].root_doc_id);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_named_private_vault_from_before_v0_5_0_keeps_its_root_and_loses_its_name(
+        pool: PgPool,
+    ) {
+        let (authz, _repo) = open(&pool).await;
+        let alice = did("alice");
+        let before = authz.private_vault(&alice).await.unwrap();
+        // As v0.4 left it: the private vault carries the name it was made with.
+        sqlx::query("UPDATE vaults SET name = 'SCN Notes' WHERE workspace_id IS NULL")
+            .execute(&pool)
             .await
-            .unwrap()
-            .into_iter()
-            .map(|vault| vault.name)
-            .collect();
-        assert_eq!(names, ["Notes", "Work"]);
+            .unwrap();
+        drop(authz);
 
-        for bad in ["", "   ", &"x".repeat(101)] {
-            let result = authz.create_vault(&alice, bad).await;
-            assert!(matches!(result, Err(CreateVaultError::InvalidName)));
-        }
-        authz.create_vault(&alice, &"x".repeat(100)).await.unwrap();
+        let (authz, _repo) = open(&pool).await;
+        let after = authz.vaults_of(&alice).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].root_doc_id, before.root_doc_id);
+        assert_eq!(after[0].path, "Private");
+        assert_eq!(after[0].name, None);
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT name FROM vaults WHERE workspace_id IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, None);
     }
 
     /// A member whose token names these workspaces.
@@ -1047,7 +1069,7 @@ pub(crate) mod tests {
         workspace: &str,
     ) -> (DocumentId, DocHandle) {
         let vault = authz
-            .create_workspace_vault(&did("alice"), workspace, "Garden")
+            .workspace_vault(&did("alice"), workspace, "Garden")
             .await
             .unwrap();
         assert_eq!(vault.workspace.as_deref(), Some(workspace));
@@ -1122,32 +1144,34 @@ pub(crate) mod tests {
     #[sqlx::test(migrations = false)]
     async fn a_workspace_has_one_vault_apart_from_its_members_own(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        workspace_vault(&authz, &repo, "7").await;
+        let (root, _) = workspace_vault(&authz, &repo, "7").await;
 
+        // Asked for again, by anyone, it is the same vault under the name
+        // Corliss sends: that is how a rename reaches it.
         let again = authz
-            .create_workspace_vault(&did("bob"), "7", "Other")
-            .await;
-        assert!(matches!(again, Err(CreateVaultError::WorkspaceHasVault)));
-
-        // The workspace's vault takes no name from its creator's own.
-        authz.create_vault(&did("alice"), "Garden").await.unwrap();
-        authz
-            .create_workspace_vault(&did("alice"), "8", "Garden")
+            .workspace_vault(&did("bob"), "7", " Garden Club ")
             .await
             .unwrap();
+        assert_eq!(again.root_doc_id, root.to_string());
+        assert_eq!(again.path, "Workspaces/Garden Club");
+
+        for bad in ["", "   ", &"x".repeat(101)] {
+            let result = authz.workspace_vault(&did("bob"), "7", bad).await;
+            assert!(matches!(result, Err(CreateVaultError::InvalidName)));
+        }
 
         let listed: Vec<_> = authz
             .list_vaults(&member_of("alice", &["7"]))
             .await
             .unwrap()
             .into_iter()
-            .map(|vault| (vault.name, vault.workspace))
+            .map(|vault| (vault.path, vault.workspace))
             .collect();
         assert_eq!(
             listed,
             [
-                ("Garden".to_string(), Some("7".to_string())),
-                ("Garden".to_string(), None),
+                ("Workspaces/Garden Club".to_string(), Some("7".to_string())),
+                ("Private".to_string(), None),
             ]
         );
     }
@@ -1181,7 +1205,7 @@ pub(crate) mod tests {
         let alice = did("alice");
         let (root, note_id) = {
             let (authz, repo) = open(&pool).await;
-            let (root, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+            let (root, root_doc) = vault(&authz, &repo, &alice).await;
             let note = sent(&authz, &repo, &alice, Automerge::new()).await;
             let note_id = note.document_id().clone();
             link(&root_doc, "a.md", "md", &note_id).await;

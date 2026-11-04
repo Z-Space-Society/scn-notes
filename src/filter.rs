@@ -330,7 +330,7 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn another_members_document_is_denied_and_withheld(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        let vault = authz.create_vault(&did("alice"), "Notes").await.unwrap();
+        let vault = authz.private_vault(&did("alice")).await.unwrap();
         let root = vault.root_doc_id.parse().unwrap();
         let note = repo.create(Automerge::new()).await.unwrap();
         let note = note.document_id();
