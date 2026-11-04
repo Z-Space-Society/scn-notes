@@ -126,6 +126,46 @@ pub struct Vault {
     pub bytes: Option<i64>,
 }
 
+/// A vault with the DID that made it, for the admin listing only.
+///
+/// A wrapper rather than a field on [`Vault`], so the member-facing listings
+/// never start telling a workspace's members which of them made its vault.
+#[derive(Clone, Debug, Serialize)]
+pub struct HeldVault {
+    pub owner_did: String,
+    #[serde(flatten)]
+    pub vault: Vault,
+}
+
+/// One creator's documents that no vault reaches.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Unfiled {
+    pub did: String,
+    pub docs: usize,
+    pub bytes: i64,
+}
+
+/// A `vaults` row as a [`Vault`], with what the index knows filled in.
+fn vault_from(row: &sqlx::postgres::PgRow, reach: &reach::Index) -> Result<Vault> {
+    let root: String = row.try_get("root_doc_id")?;
+    let id = DocumentId::from_str(&root).ok();
+    // Memory is ahead of the table by up to a minute.
+    let in_memory = id.as_ref().and_then(|id| reach.last_change(id));
+    let name: String = row.try_get("name")?;
+    let workspace: Option<String> = row.try_get("workspace_id")?;
+    Ok(Vault {
+        url: format!("automerge:{root}"),
+        note_count: id.as_ref().and_then(|id| reach.note_count(id)),
+        root_doc_id: root,
+        path: path_of(&name, workspace.as_deref()),
+        name,
+        workspace,
+        created_at: row.try_get("created_at")?,
+        last_change_at: in_memory.or(row.try_get("last_change_at")?),
+        bytes: None,
+    })
+}
+
 #[derive(Debug)]
 pub enum CreateVaultError {
     /// The name is empty or too long once trimmed.
@@ -317,52 +357,96 @@ impl Authz {
         .await?;
 
         let reach = self.0.reach.read().unwrap();
-        let mut vaults = Vec::with_capacity(rows.len());
-        for row in rows {
-            let root: String = row.try_get("root_doc_id")?;
-            let id = DocumentId::from_str(&root).ok();
-            // Memory is ahead of the table by up to a minute.
-            let in_memory = id.as_ref().and_then(|id| reach.last_change(id));
-            let name: String = row.try_get("name")?;
-            let workspace: Option<String> = row.try_get("workspace_id")?;
-            vaults.push(Vault {
-                url: format!("automerge:{root}"),
-                note_count: id.as_ref().and_then(|id| reach.note_count(id)),
-                root_doc_id: root,
-                path: path_of(&name, workspace.as_deref()),
-                name,
-                workspace,
-                created_at: row.try_get("created_at")?,
-                last_change_at: in_memory.or(row.try_get("last_change_at")?),
-                bytes: None,
+        rows.iter().map(|row| vault_from(row, &reach)).collect()
+    }
+
+    /// Every vault on the relay, with the DID that made it, for Corliss's
+    /// admin view. Takes no argument on purpose: there is nothing for a
+    /// request to choose.
+    pub async fn all_vaults(&self) -> Result<Vec<HeldVault>> {
+        let rows = sqlx::query(
+            "SELECT root_doc_id, owner_did, name, workspace_id, created_at, last_change_at
+             FROM vaults ORDER BY created_at, root_doc_id",
+        )
+        .fetch_all(&self.0.pool)
+        .await?;
+
+        let reach = self.0.reach.read().unwrap();
+        rows.iter()
+            .map(|row| {
+                Ok(HeldVault {
+                    owner_did: row.try_get("owner_did")?,
+                    vault: vault_from(row, &reach)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Per creator, the documents they sent that no vault reaches, and the
+    /// bytes those take. `None` until every vault has been walked, because an
+    /// unwalked vault's documents would be counted here.
+    ///
+    /// These are notes linked from no folder: deleted entries, a move cut off
+    /// part way, a first frame whose folder never arrived, and entries of a
+    /// type the relay does not index.
+    pub async fn unfiled(&self) -> Result<Option<Vec<Unfiled>>> {
+        let by_creator = {
+            let reach = self.0.reach.read().unwrap();
+            if !reach.all_walked() {
+                return Ok(None);
+            }
+            let creators = self.0.creators.read().unwrap();
+            let mut by_creator: HashMap<String, Vec<String>> = HashMap::new();
+            for (doc, creator) in creators.iter() {
+                if reach.vault_of(doc).is_none() {
+                    by_creator
+                        .entry(creator.did.0.clone())
+                        .or_default()
+                        .push(doc.to_string());
+                }
+            }
+            by_creator
+        };
+
+        let mut unfiled = Vec::with_capacity(by_creator.len());
+        for (did, docs) in by_creator {
+            unfiled.push(Unfiled {
+                bytes: self.bytes_of(&docs).await?,
+                docs: docs.len(),
+                did,
             });
         }
-        Ok(vaults)
+        unfiled.sort_by(|a, b| a.did.cmp(&b.did));
+        Ok(Some(unfiled))
     }
 
     /// Fill in `bytes` for vaults that have been walked.
-    pub async fn add_sizes(&self, vaults: &mut [Vault]) -> Result<()> {
+    pub async fn add_sizes(&self, vaults: impl IntoIterator<Item = &mut Vault>) -> Result<()> {
         for vault in vaults {
             let docs = DocumentId::from_str(&vault.root_doc_id)
                 .ok()
                 .and_then(|root| self.0.reach.read().unwrap().docs_of(&root));
             let Some(docs) = docs else { continue };
             let docs: Vec<String> = docs.iter().map(ToString::to_string).collect();
-            // A document's rows are the keys from `<id>/` up to `<id>0`, `0`
-            // being the character after `/`. The `~>=~` and `~<~` operators
-            // are the ones `text_pattern_ops` serves, so this is one index
-            // range per document; a `LIKE` on a joined value would scan.
-            let size: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(SUM(octet_length(s.value)), 0)::BIGINT
-                 FROM unnest($1::TEXT[]) AS d(id)
-                 JOIN storage s ON s.key ~>=~ (d.id || '/') AND s.key ~<~ (d.id || '0')",
-            )
-            .bind(&docs)
-            .fetch_one(&self.0.pool)
-            .await?;
-            vault.bytes = Some(size);
+            vault.bytes = Some(self.bytes_of(&docs).await?);
         }
         Ok(())
+    }
+
+    /// The bytes these documents take in storage.
+    async fn bytes_of(&self, docs: &[String]) -> Result<i64> {
+        // A document's rows are the keys from `<id>/` up to `<id>0`, `0`
+        // being the character after `/`. The `~>=~` and `~<~` operators
+        // are the ones `text_pattern_ops` serves, so this is one index
+        // range per document; a `LIKE` on a joined value would scan.
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE(SUM(octet_length(s.value)), 0)::BIGINT
+             FROM unnest($1::TEXT[]) AS d(id)
+             JOIN storage s ON s.key ~>=~ (d.id || '/') AND s.key ~<~ (d.id || '0')",
+        )
+        .bind(docs)
+        .fetch_one(&self.0.pool)
+        .await?)
     }
 
     /// Create a vault for a member: an empty root folder document and its row.
@@ -566,6 +650,10 @@ pub(crate) mod tests {
     impl Authz {
         fn vault_of(&self, doc: &DocumentId) -> Option<DocumentId> {
             self.0.reach.read().unwrap().vault_of(doc).cloned()
+        }
+
+        pub fn all_walked(&self) -> bool {
+            self.0.reach.read().unwrap().all_walked()
         }
 
         /// [`Authz::may_open`] for a member in no workspace.
@@ -848,6 +936,59 @@ pub(crate) mod tests {
         }
         authz.add_sizes(&mut vaults).await.unwrap();
         assert_eq!(vaults[0].bytes, Some(expected));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn documents_no_vault_reaches_are_counted_per_creator(pool: PgPool) {
+        let (authz, repo) = open(&pool).await;
+        let (alice, bob) = (did("alice"), did("bob"));
+        let (root, root_doc) = vault(&authz, &repo, &alice, "Notes").await;
+
+        let filed = sent(&authz, &repo, &alice, Automerge::new()).await;
+        link(&root_doc, "a.md", "md", filed.document_id()).await;
+        let stray = sent(&authz, &repo, &alice, Automerge::new()).await;
+        let bobs = sent(&authz, &repo, &bob, Automerge::new()).await;
+        let filed = filed.document_id().clone();
+        eventually("the filed note is in the vault", || {
+            authz.vault_of(&filed) == Some(root.clone())
+        })
+        .await;
+
+        let mut expected = Vec::new();
+        for (owner, doc) in [(&alice, stray.document_id()), (&bob, bobs.document_id())] {
+            let bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(octet_length(value)), 0)::BIGINT
+                 FROM storage WHERE key LIKE $1 || '/%'",
+            )
+            .bind(doc.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            expected.push(Unfiled {
+                did: owner.0.clone(),
+                docs: 1,
+                bytes,
+            });
+        }
+        assert_eq!(authz.unfiled().await.unwrap(), Some(expected));
+
+        let all = authz.all_vaults().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_did, alice.0);
+        assert_eq!(all[0].vault.note_count, Some(1));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn unfiled_is_unknown_until_every_vault_is_walked(pool: PgPool) {
+        let (authz, repo) = open(&pool).await;
+        let (root, _) = vault(&authz, &repo, &did("alice"), "Notes").await;
+        // Let the first walk finish so it cannot land after the line below.
+        eventually("the vault is walked", || authz.all_walked()).await;
+        assert!(authz.unfiled().await.unwrap().is_some());
+        // Stand in for the moment after startup when a vault is registered
+        // and its walk has not finished.
+        authz.0.reach.write().unwrap().forget_walk(&root);
+        assert_eq!(authz.unfiled().await.unwrap(), None);
     }
 
     #[sqlx::test(migrations = false)]

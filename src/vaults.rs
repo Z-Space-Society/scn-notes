@@ -1,9 +1,10 @@
 //! The vault endpoints.
 //!
 //! `GET /vaults` is for a member, who presents the same token as for sync and
-//! sees their own vaults and their workspaces'. The two `/internal/vaults`
+//! sees their own vaults and their workspaces'. The `/internal/vaults`
 //! endpoints are for Corliss, which lists and creates vaults on a member's
-//! behalf and presents a shared service credential. The `/internal/` prefix exists so the proxy can leave it
+//! behalf, and lists every vault for its admins, presenting a shared service
+//! credential. The `/internal/` prefix exists so the proxy can leave it
 //! unrouted: it is reachable on the internal network only.
 //!
 //! Vaults are created here and nowhere else. No sync client makes one.
@@ -111,6 +112,31 @@ pub async fn list_for_member(
     }
     let vaults = state.authz.vaults_where(&Did(query.did), &workspaces).await;
     list(&state, vaults).await
+}
+
+/// `GET /internal/vaults/all`: every vault with the DID that made it, and per
+/// creator the documents no vault reaches. For Corliss's admin view.
+///
+/// Takes no query parameters at all, so no request can choose whose vaults it
+/// gets: it is everyone's or a `401`. Who may see the answer is Corliss's
+/// question, asked by the admin gate on the one page that calls this.
+pub async fn list_all(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_service(&state, &headers) {
+        return unauthorized();
+    }
+    let mut held = match state.authz.all_vaults().await {
+        Ok(held) => held,
+        Err(e) => return internal_error(e),
+    };
+    // Collected first: a lazy `map` held across the await is not `Send`.
+    let vaults: Vec<&mut Vault> = held.iter_mut().map(|h| &mut h.vault).collect();
+    if let Err(e) = state.authz.add_sizes(vaults).await {
+        return internal_error(e);
+    }
+    match state.authz.unfiled().await {
+        Ok(unfiled) => Json(json!({ "vaults": held, "unfiled": unfiled })).into_response(),
+        Err(e) => internal_error(e),
+    }
 }
 
 #[derive(Deserialize)]

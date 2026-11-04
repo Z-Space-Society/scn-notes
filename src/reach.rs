@@ -80,9 +80,23 @@ impl Index {
     }
 
     /// The root of the vault a document is in, if any.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn vault_of(&self, doc: &DocumentId) -> Option<&DocumentId> {
         self.doc_to_root.get(doc)
+    }
+
+    /// Has every vault been walked at least once? Until then a document can
+    /// look as if no vault reaches it only because its vault's walk is still
+    /// to come.
+    pub(crate) fn all_walked(&self) -> bool {
+        self.vaults.values().all(|vault| vault.notes.is_some())
+    }
+
+    /// Put a vault back in its state before its first walk.
+    #[cfg(test)]
+    pub(crate) fn forget_walk(&mut self, root: &DocumentId) {
+        if let Some(vault) = self.vaults.get_mut(root) {
+            vault.notes = None;
+        }
     }
 
     pub(crate) fn last_change(&self, root: &DocumentId) -> Option<DateTime<Utc>> {

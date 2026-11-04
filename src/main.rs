@@ -180,6 +180,7 @@ fn router(state: AppState) -> Router {
                 .post(vaults::create)
                 .patch(vaults::rename),
         )
+        .route("/internal/vaults/all", get(vaults::list_all))
         .with_state(state)
 }
 
@@ -611,6 +612,72 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn the_admin_listing_is_everyones_and_takes_no_parameters(pool: PgPool) {
+        let (base, authz) = relay(&pool).await;
+        create_vault(&base, ALICE, "Notes").await;
+        create_vault(&base, BOB, "Private").await;
+        reqwest::Client::new()
+            .post(format!("{base}/internal/vaults"))
+            .bearer_auth(SERVICE_TOKEN)
+            .json(&json!({ "did": BOB, "name": "Garden", "workspace": "7" }))
+            .send()
+            .await
+            .unwrap();
+        authz::tests::eventually("every vault is walked", || authz.all_walked()).await;
+
+        let client = reqwest::Client::new();
+        let all = |query: &str| {
+            client
+                .get(format!("{base}/internal/vaults/all{query}"))
+                .bearer_auth(SERVICE_TOKEN)
+                .send()
+        };
+        let body: Value = all("").await.unwrap().json().await.unwrap();
+        let listed: Vec<_> = body["vaults"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|vault| {
+                assert!(vault["bytes"].is_i64(), "{vault}");
+                (
+                    vault["owner_did"].as_str().unwrap(),
+                    vault["path"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (ALICE, "Private/Notes"),
+                (BOB, "Private/Private"),
+                (BOB, "Workspaces/Garden"),
+            ]
+        );
+        assert_eq!(body["unfiled"], json!([]));
+
+        // A query string is not read: it cannot narrow the listing to anyone.
+        let narrowed: Value = all(&format!("?did={ALICE}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(narrowed["vaults"], body["vaults"]);
+
+        // The member-facing listings never carry the creator.
+        let own: Value = client
+            .get(format!("{base}/vaults"))
+            .bearer_auth(member_token(ALICE))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(own["vaults"][0].get("owner_did").is_none());
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn vault_endpoints_refuse_the_wrong_credential(pool: PgPool) {
         let (base, _) = relay(&pool).await;
         let client = reqwest::Client::new();
@@ -639,6 +706,9 @@ mod tests {
             client.post(&internal).json(&body),
             client.post(&internal).json(&body).bearer_auth("wrong"),
             client.post(&internal).json(&body).bearer_auth(&member),
+            client.get(format!("{internal}/all")),
+            client.get(format!("{internal}/all")).bearer_auth("wrong"),
+            client.get(format!("{internal}/all")).bearer_auth(&member),
         ] {
             let response = request.send().await.unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
