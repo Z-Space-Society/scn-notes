@@ -445,6 +445,7 @@ mod tests {
         let (status, vault) = create_vault(&base, ALICE, "Notes").await;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(vault["name"], "Notes");
+        assert_eq!(vault["path"], "Private/Notes");
         assert_eq!(
             vault["url"],
             format!("automerge:{}", vault["root_doc_id"].as_str().unwrap())
@@ -520,6 +521,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         let vault: Value = response.json().await.unwrap();
         assert_eq!(vault["workspace"], "7");
+        assert_eq!(vault["path"], "Workspaces/Garden");
 
         let response = create(json!({ "did": BOB, "name": "Other", "workspace": "7" }))
             .await
@@ -565,7 +567,14 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let own = client.get(format!("{base}/vaults")).bearer_auth(&bob_in_7);
-        assert_eq!(names(own).await, ["Garden Club", "Private"]);
+        let listed: Value = own.send().await.unwrap().json().await.unwrap();
+        let paths: Vec<_> = listed["vaults"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|vault| vault["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["Workspaces/Garden Club", "Private/Private"]);
 
         for (body, status, code) in [
             (

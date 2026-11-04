@@ -86,6 +86,25 @@ impl std::fmt::Display for Holder {
     }
 }
 
+/// The group a member's private vaults are listed under.
+pub const PRIVATE: &str = "Private";
+/// The group workspaces' vaults are listed under.
+pub const WORKSPACES: &str = "Workspaces";
+
+/// A vault's name with its group: `Private/Notes`, `Workspaces/Garden Club`.
+///
+/// The one place these words are spelled. Every listing carries the result as
+/// `path`, so MCP, the Obsidian plugin's folders and Corliss's pages all show
+/// what this says rather than each building it.
+pub fn path_of(name: &str, workspace: Option<&str>) -> String {
+    let group = if workspace.is_some() {
+        WORKSPACES
+    } else {
+        PRIVATE
+    };
+    format!("{group}/{name}")
+}
+
 /// A vault as the endpoints return it.
 #[derive(Clone, Debug, Serialize)]
 pub struct Vault {
@@ -94,6 +113,9 @@ pub struct Vault {
     pub name: String,
     /// The workspace that holds the vault, or null for a member's own.
     pub workspace: Option<String>,
+    /// The name with its group, from [`path_of`]: how MCP names the vault and
+    /// where the Obsidian plugin puts it.
+    pub path: String,
     pub created_at: DateTime<Utc>,
     pub last_change_at: Option<DateTime<Utc>>,
     /// Null until the relay has walked the vault since it started.
@@ -301,12 +323,15 @@ impl Authz {
             let id = DocumentId::from_str(&root).ok();
             // Memory is ahead of the table by up to a minute.
             let in_memory = id.as_ref().and_then(|id| reach.last_change(id));
+            let name: String = row.try_get("name")?;
+            let workspace: Option<String> = row.try_get("workspace_id")?;
             vaults.push(Vault {
                 url: format!("automerge:{root}"),
                 note_count: id.as_ref().and_then(|id| reach.note_count(id)),
                 root_doc_id: root,
-                name: row.try_get("name")?,
-                workspace: row.try_get("workspace_id")?,
+                path: path_of(&name, workspace.as_deref()),
+                name,
+                workspace,
                 created_at: row.try_get("created_at")?,
                 last_change_at: in_memory.or(row.try_get("last_change_at")?),
                 bytes: None,
@@ -445,6 +470,7 @@ impl Authz {
         Ok(Vault {
             url: AutomergeUrl::from(&root).to_string(),
             root_doc_id: root.to_string(),
+            path: path_of(name, workspace.as_deref()),
             name: name.to_string(),
             workspace,
             created_at,

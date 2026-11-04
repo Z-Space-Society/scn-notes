@@ -14,10 +14,11 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::json;
 
-use super::notes::{qualified, NoteError, Notes, PRIVATE, WORKSPACES};
+use super::notes::{NoteError, Notes};
 use super::search;
 use crate::auth::Caller;
 use crate::authz::Authz;
+use crate::authz::{PRIVATE, WORKSPACES};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 50;
@@ -164,7 +165,7 @@ impl NotesServer {
                         .filter(|vault| vault.workspace.is_some() == shared)
                         .map(|vault| {
                             json!({
-                                "vault": qualified(vault),
+                                "vault": vault.path,
                                 "name": vault.name,
                                 "created_at": vault.created_at,
                                 "last_change_at": vault.last_change_at,
