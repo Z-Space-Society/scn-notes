@@ -176,7 +176,9 @@ fn router(state: AppState) -> Router {
         .route("/.well-known/oauth-protected-resource", get(sync_metadata))
         .route(
             "/internal/vaults",
-            get(vaults::list_for_member).post(vaults::create),
+            get(vaults::list_for_member)
+                .post(vaults::create)
+                .patch(vaults::rename),
         )
         .with_state(state)
 }
@@ -534,11 +536,10 @@ mod tests {
         create_vault(&base, BOB, "Private").await;
         let bob_in_7 = TokenSpec::default()
             .claim("sub", json!(BOB))
-            .claim("workspaces", json!([{ "id": "7", "name": "Garden Club" }]))
+            .claim("workspaces", json!(["7"]))
             .sign();
-        // The token's name for the workspace, not the one it was created with.
-        let own = client.get(format!("{base}/vaults")).bearer_auth(bob_in_7);
-        assert_eq!(names(own).await, ["Garden Club", "Private"]);
+        let own = client.get(format!("{base}/vaults")).bearer_auth(&bob_in_7);
+        assert_eq!(names(own).await, ["Garden", "Private"]);
 
         // Alice made it, and a token naming no workspace still does not list it.
         let alice = client
@@ -550,6 +551,54 @@ mod tests {
             .get(format!("{base}/internal/vaults?did={BOB}&workspaces=7,9"))
             .bearer_auth(SERVICE_TOKEN);
         assert_eq!(names(for_bob).await, ["Garden", "Private"]);
+
+        // The workspace is renamed in Corliss, which tells the relay.
+        let rename = |body: Value| {
+            client
+                .patch(format!("{base}/internal/vaults"))
+                .bearer_auth(SERVICE_TOKEN)
+                .json(&body)
+                .send()
+        };
+        let response = rename(json!({ "workspace": "7", "name": " Garden Club " }))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let own = client.get(format!("{base}/vaults")).bearer_auth(&bob_in_7);
+        assert_eq!(names(own).await, ["Garden Club", "Private"]);
+
+        for (body, status, code) in [
+            (
+                json!({ "workspace": "9", "name": "Seeds" }),
+                StatusCode::NOT_FOUND,
+                "no_vault",
+            ),
+            (
+                json!({ "workspace": "7", "name": "  " }),
+                StatusCode::BAD_REQUEST,
+                "invalid_name",
+            ),
+            (
+                json!({ "workspace": "a/b", "name": "Seeds" }),
+                StatusCode::BAD_REQUEST,
+                "invalid_workspace",
+            ),
+        ] {
+            let response = rename(body.clone()).await.unwrap();
+            assert_eq!(response.status(), status, "{body}");
+            let answer: Value = response.json().await.unwrap();
+            assert_eq!(answer["error"], code, "{body}");
+        }
+
+        // Without the service credential, nothing is renamed.
+        let response = client
+            .patch(format!("{base}/internal/vaults"))
+            .bearer_auth(member_token(BOB))
+            .json(&json!({ "workspace": "7", "name": "Mine" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[sqlx::test(migrations = false)]
@@ -784,12 +833,8 @@ mod tests {
             self.mcp_token_in(did, &[])
         }
 
-        /// An MCP token for a member in these workspaces, given as ID and name.
-        fn mcp_token_in(&self, did: &str, workspaces: &[(&str, &str)]) -> String {
-            let workspaces: Vec<Value> = workspaces
-                .iter()
-                .map(|(id, name)| json!({ "id": id, "name": name }))
-                .collect();
+        /// An MCP token for a member in these workspaces.
+        fn mcp_token_in(&self, did: &str, workspaces: &[&str]) -> String {
             TokenSpec::default()
                 .claim("sub", json!(did))
                 .claim("aud", json!(self.mcp))
@@ -819,7 +864,7 @@ mod tests {
         async fn call_in(
             &self,
             did: &str,
-            workspaces: &[(&str, &str)],
+            workspaces: &[&str],
             tool: &str,
             arguments: Value,
         ) -> (bool, String) {
@@ -905,18 +950,23 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn mcp_groups_vaults_as_private_and_workspaces(pool: PgPool) {
         let relay = start(&pool).await;
-        // Created under one name; the token's name for the workspace wins.
+        // Created under one name and renamed with its workspace.
         relay
             .authz
             .create_workspace_vault(&auth::Did(ALICE.into()), "7", "Old name")
             .await
             .unwrap();
+        assert!(relay
+            .authz
+            .rename_workspace_vault("7", "Notes")
+            .await
+            .unwrap());
         relay
             .authz
             .create_vault(&auth::Did(BOB.into()), "Notes")
             .await
             .unwrap();
-        let in_7 = [("7", "Notes")];
+        let in_7 = ["7"];
 
         // Alice writes to the workspace's vault, her only one.
         let (is_error, text) = relay

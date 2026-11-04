@@ -45,12 +45,9 @@ impl fmt::Display for Did {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Caller {
     pub did: Did,
-    /// Workspace IDs. Every access decision compares these and nothing else.
+    /// Workspace IDs, opaque: the token travels in a websocket URL, so it
+    /// names no workspace in words.
     pub workspaces: Vec<String>,
-    /// Each workspace's name as Corliss gave it, by ID, for display only. A
-    /// workspace's vault is listed under it, so a rename in Corliss shows on
-    /// the next token. Empty for a recorded creator, whose names are not kept.
-    pub names: HashMap<String, String>,
 }
 
 impl Caller {
@@ -58,17 +55,8 @@ impl Caller {
         self.workspaces.iter().any(|w| w == workspace)
     }
 
-    pub fn name_of(&self, workspace: &str) -> Option<&str> {
-        self.names.get(workspace).map(String::as_str)
-    }
-
-    /// A caller known by workspace IDs alone, as a recorded creator is.
     pub fn in_workspaces(did: Did, workspaces: Vec<String>) -> Self {
-        Self {
-            did,
-            workspaces,
-            names: HashMap::new(),
-        }
+        Self { did, workspaces }
     }
 }
 
@@ -78,7 +66,6 @@ impl From<Did> for Caller {
         Self {
             did,
             workspaces: Vec::new(),
-            names: HashMap::new(),
         }
     }
 }
@@ -192,22 +179,11 @@ pub struct CorlissVerifier {
 struct Claims {
     sub: String,
     exp: u64,
-    /// The workspaces the member was in at issue. Absent from a token issued
-    /// before Corliss sent it, which reads as no workspaces.
+    /// The IDs of the workspaces the member was in at issue. Absent from a
+    /// token issued before Corliss sent it, which reads as no workspaces.
     #[serde(default)]
-    workspaces: Vec<WorkspaceClaim>,
+    workspaces: Vec<String>,
 }
-
-/// One workspace in the `workspaces` claim: `{"id": "7", "name": "Garden"}`.
-#[derive(Deserialize)]
-struct WorkspaceClaim {
-    id: String,
-    name: String,
-}
-
-/// The longest workspace name, in characters, after trimming. The same as a
-/// vault name's, since a workspace's vault is listed under it.
-const MAX_WORKSPACE_NAME: usize = 100;
 
 impl CorlissVerifier {
     /// Build the verifier and load the issuer's keys.
@@ -342,25 +318,14 @@ impl CorlissVerifier {
         if !is_did(&claims.sub) {
             return Err(invalid("subject is not a DID"));
         }
-        let mut workspaces = Vec::with_capacity(claims.workspaces.len());
-        let mut names = HashMap::with_capacity(claims.workspaces.len());
-        for claim in claims.workspaces {
-            if !is_workspace_id(&claim.id) {
-                return Err(invalid("a workspace ID is malformed"));
-            }
-            let name = claim.name.trim();
-            if name.is_empty() || name.chars().count() > MAX_WORKSPACE_NAME {
-                return Err(invalid("a workspace name is empty or too long"));
-            }
-            names.insert(claim.id.clone(), name.to_string());
-            workspaces.push(claim.id);
+        if !claims.workspaces.iter().all(|w| is_workspace_id(w)) {
+            return Err(invalid("a workspace ID is malformed"));
         }
 
         Ok(Verified {
             caller: Caller {
                 did: Did(claims.sub),
-                workspaces,
-                names,
+                workspaces: claims.workspaces,
             },
             expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(claims.exp)),
         })
@@ -544,33 +509,21 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn workspaces_claim_is_read() {
-        let spec = TokenSpec::default().claim(
-            "workspaces",
-            json!([
-                { "id": "7", "name": " Garden Club " },
-                { "id": "garden-2", "name": "Seeds" },
-            ]),
-        );
+        let spec = TokenSpec::default().claim("workspaces", json!(["7", "garden-2"]));
         let caller = verify(spec).await.unwrap().caller;
         assert!(caller.is_in("7"));
         assert!(caller.is_in("garden-2"));
         assert!(!caller.is_in("8"));
-        assert_eq!(caller.name_of("7"), Some("Garden Club"));
-        assert_eq!(caller.name_of("8"), None);
     }
 
     #[tokio::test]
     async fn malformed_workspaces_claim_is_refused() {
-        let ok = |id: &str| json!({ "id": id, "name": "Garden" });
         for bad in [
-            json!([ok("7"), ok("")]),
-            json!([ok("a/b")]),
-            json!([ok(&"x".repeat(65))]),
-            json!([{ "id": "7", "name": "  " }]),
-            json!([{ "id": "7", "name": "x".repeat(101) }]),
-            json!([{ "id": "7" }]),
-            json!([{ "id": 7, "name": "Garden" }]),
-            json!(["7"]),
+            json!(["7", ""]),
+            json!(["a/b"]),
+            json!(["x".repeat(65)]),
+            json!([7]),
+            json!([{ "id": "7", "name": "Garden" }]),
             json!("7"),
         ] {
             let spec = TokenSpec::default().claim("workspaces", bad.clone());
