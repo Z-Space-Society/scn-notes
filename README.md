@@ -208,10 +208,12 @@ client makes one.
   gets slow.
 
 **Filing a member's unfiled documents.** `scn-sync-relay file-unfiled <did>
-[--folder <name>] [--apply]` lists the documents of `<did>` that no vault
+[--folder <name>] [--apply | --delete]` lists the documents of `<did>` that no vault
 reaches. With `--apply`, it links them into a new folder (`Recovered` unless
 named) at the root of that member's private vault, where they appear on every
-device.
+device. With `--delete`, it removes them instead, each with everything it
+holds: their stored history and their creator rows, in one transaction, after
+checking again that each is still the member's and in no vault.
 
 - **Run it with the service stopped**, with the service's environment, so
   that nothing else writes the vault's root folder at the same time. It waits
