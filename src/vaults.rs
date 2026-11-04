@@ -157,3 +157,36 @@ pub async fn create(
         Err(CreateVaultError::Internal(e)) => internal_error(e),
     }
 }
+
+#[derive(Deserialize)]
+pub struct Rename {
+    workspace: String,
+    name: String,
+}
+
+/// `PATCH /internal/vaults`: rename a workspace's vault, for Corliss, when the
+/// workspace is renamed.
+pub async fn rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Rename>,
+) -> Response {
+    if !is_service(&state, &headers) {
+        return unauthorized();
+    }
+    if !is_workspace_id(&body.workspace) {
+        return error(StatusCode::BAD_REQUEST, "invalid_workspace");
+    }
+    match state
+        .authz
+        .rename_workspace_vault(&body.workspace, &body.name)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "no_vault"),
+        Err(CreateVaultError::InvalidName) => error(StatusCode::BAD_REQUEST, "invalid_name"),
+        Err(CreateVaultError::Internal(e)) => internal_error(e),
+        // A workspace's vault name is its own; nothing can take it.
+        Err(other) => internal_error(anyhow::anyhow!("rename failed: {other:?}")),
+    }
+}

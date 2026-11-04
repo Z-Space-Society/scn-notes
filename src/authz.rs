@@ -252,19 +252,32 @@ impl Authz {
 
     /// The vaults open to a caller, oldest first: their own, then their
     /// workspaces', interleaved by age.
-    ///
-    /// A workspace's vault is named as the token names the workspace, so a
-    /// rename in Corliss reaches it without the relay being told. The name
-    /// stored at creation is the fallback, and is what Corliss's own listing
-    /// shows.
     pub async fn list_vaults(&self, caller: &Caller) -> Result<Vec<Vault>> {
-        let mut vaults = self.vaults_where(&caller.did, &caller.workspaces).await?;
-        for vault in &mut vaults {
-            if let Some(name) = vault.workspace.as_deref().and_then(|w| caller.name_of(w)) {
-                vault.name = name.to_string();
-            }
+        self.vaults_where(&caller.did, &caller.workspaces).await
+    }
+
+    /// Rename a workspace's vault. Corliss calls this when the workspace is
+    /// renamed, since a workspace's vault carries its name. Returns false when
+    /// the workspace has no vault.
+    ///
+    /// Only the listing changes. The root folder's own `title` is left alone:
+    /// no client reads it, and rewriting it would be an edit every member
+    /// syncs.
+    pub async fn rename_workspace_vault(
+        &self,
+        workspace: &str,
+        name: &str,
+    ) -> Result<bool, CreateVaultError> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > MAX_VAULT_NAME {
+            return Err(CreateVaultError::InvalidName);
         }
-        Ok(vaults)
+        let renamed = sqlx::query("UPDATE vaults SET name = $1 WHERE workspace_id = $2")
+            .bind(name)
+            .bind(workspace)
+            .execute(&self.0.pool)
+            .await?;
+        Ok(renamed.rows_affected() > 0)
     }
 
     /// The vaults a member holds plus those of the named workspaces. Corliss
@@ -838,16 +851,12 @@ pub(crate) mod tests {
         authz.create_vault(&alice, &"x".repeat(100)).await.unwrap();
     }
 
-    /// A member whose token names these workspaces, each named "Garden <id>".
+    /// A member whose token names these workspaces.
     pub fn member_of(name: &str, workspaces: &[&str]) -> Caller {
-        Caller {
-            did: did(name),
-            workspaces: workspaces.iter().map(|w| w.to_string()).collect(),
-            names: workspaces
-                .iter()
-                .map(|w| (w.to_string(), format!("Garden {w}")))
-                .collect(),
-        }
+        Caller::in_workspaces(
+            did(name),
+            workspaces.iter().map(|w| w.to_string()).collect(),
+        )
     }
 
     /// A document as a sync client in some workspaces would have sent it.
@@ -965,8 +974,7 @@ pub(crate) mod tests {
         assert_eq!(
             listed,
             [
-                // Listed under the token's name for the workspace.
-                ("Garden 7".to_string(), Some("7".to_string())),
+                ("Garden".to_string(), Some("7".to_string())),
                 ("Garden".to_string(), None),
             ]
         );

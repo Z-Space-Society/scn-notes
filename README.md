@@ -89,6 +89,7 @@ On the sync listener (`BIND`):
 | `GET /vaults` | member | The caller's vaults and their token's workspaces' vaults. `Authorization: Bearer` with a sync token. |
 | `GET /internal/vaults?did=&workspaces=` | Corliss | A member's vaults, plus those of the comma-separated workspace IDs. `Authorization: Bearer` with the service token. |
 | `POST /internal/vaults` | Corliss | Create a vault: `{"did", "name"}`, or `{"did", "name", "workspace"}` for a workspace's, `did` being the member making it. Returns `201` and the vault. |
+| `PATCH /internal/vaults` | Corliss | Rename a workspace's vault: `{"workspace", "name"}`. Returns `204`, or `404` with `no_vault` when the workspace has none. |
 | `GET /.well-known/oauth-protected-resource` | anyone | Which authorization server issues sync tokens: `resource` is `SYNC_AUDIENCE`, `authorization_servers` is the issuer. A sync client given only the sync URL finds Corliss here. Not served with auth off. |
 | `GET /health` | anyone | Liveness and the current auth mode. Does not touch Postgres, so a database blip cannot get the relay restarted out from under live connections. |
 
@@ -153,14 +154,12 @@ endpoints are `{"error": "<code>"}`: `400` with `invalid_did`,
 vaults' names are unique to them whatever their letter case. A workspace has
 one vault.
 
-In a token, workspaces are the `workspaces` claim:
-`[{"id": "7", "name": "Garden Club"}]`. A token without it is in no
-workspace. An ID is 1 to 64 ASCII letters, digits, `-` and `_`, and is all
-the relay compares. A name is 1 to 100 characters after trimming, and is
-only shown: a workspace's vault is listed to a member under the name their
-token gives the workspace, so a rename in Corliss shows on the next token.
-The name a workspace's vault was created with is what Corliss's own listing
-returns.
+In a token, workspaces are the `workspaces` claim, an array of workspace
+IDs such as `["7", "12"]`. A token without it is in no workspace. An ID is 1
+to 64 ASCII letters, digits, `-` and `_`, and is opaque on purpose: a sync
+client sends its token in a websocket URL, so the token names no workspace in
+words. A workspace's vault carries the workspace's name, and Corliss renames
+it with `PATCH /internal/vaults` when the workspace is renamed.
 
 **Admission.** A document joins a vault only if the vault admits its
 creator: for a member's vault, the member made it; for a workspace's, its
