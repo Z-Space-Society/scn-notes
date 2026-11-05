@@ -22,7 +22,7 @@ use serde_json::json;
 use subtle::ConstantTimeEq;
 
 use crate::auth::{is_did, is_workspace_id, Did};
-use crate::authz::{CreateVaultError, Vault};
+use crate::authz::{CreateVaultError, Vault, PRIVATE, WORKSPACES};
 use crate::AppState;
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -54,13 +54,18 @@ fn is_service(state: &AppState, headers: &HeaderMap) -> bool {
     }
 }
 
+/// A listing, with the folders a member's vaults are grouped under. Both are
+/// named even when the member has no vault in one, so a client can show the
+/// folder before anything is in it rather than spell the word itself.
 async fn list(state: &AppState, vaults: anyhow::Result<Vec<Vault>>) -> Response {
     let mut vaults = match vaults {
         Ok(vaults) => vaults,
         Err(e) => return internal_error(e),
     };
     match state.authz.add_sizes(&mut vaults).await {
-        Ok(()) => Json(json!({ "vaults": vaults })).into_response(),
+        Ok(()) => {
+            Json(json!({ "vaults": vaults, "folders": [PRIVATE, WORKSPACES] })).into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
