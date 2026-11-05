@@ -608,6 +608,8 @@ mod tests {
             .unwrap();
         assert_eq!(own["vaults"].as_array().unwrap().len(), 1);
         assert_eq!(own["vaults"][0]["root_doc_id"], vault["root_doc_id"]);
+        // In no workspace, and still told the workspaces' folder.
+        assert_eq!(own["folders"], json!(["Private", "Workspaces"]));
 
         let response = reqwest::Client::new()
             .get(format!("{base}/internal/vaults?did=alice"))

@@ -86,7 +86,7 @@ On the sync listener (`BIND`):
 | --- | --- | --- |
 | `GET /` | sync client | WebSocket upgrade; the automerge-repo sync protocol. **This is the one clients use**: `WebSocketClientAdapter` connects to exactly the URL it is given and appends no path, so clients are configured with a bare `wss://host`. |
 | `GET /sync` | sync client | The same handler, for a client configured with an explicit path. |
-| `GET /vaults` | member | The caller's private vault and their token's workspaces' vaults. Makes the private vault if they have none yet. `Authorization: Bearer` with a sync token. |
+| `GET /vaults` | member | The caller's private vault and their token's workspaces' vaults. Makes the private vault if they have none yet. Also answers `folders`, the groups vaults are listed under (`Private`, `Workspaces`), named even when empty. `Authorization: Bearer` with a sync token. |
 | `GET /internal/vaults?did=&workspaces=` | Corliss | A member's private vault, plus the vaults of the comma-separated workspace IDs. Makes the private vault if they have none yet. `Authorization: Bearer` with the service token. |
 | `PUT /internal/vaults/workspace` | Corliss | A workspace's vault: `{"did", "workspace", "name"}`, `did` being the member asking. Made if the workspace has none, and given `name` either way, so the same call serves the workspace's page, its creation and its rename. Returns `200` and the vault. |
 | `GET /internal/vaults/all` | Corliss | Every vault with the DID that made it, and per creator the documents no vault reaches. For Corliss's admin view. Takes no parameters. `Authorization: Bearer` with the service token. |
