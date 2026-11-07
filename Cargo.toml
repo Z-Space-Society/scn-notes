@@ -1,6 +1,6 @@
 [package]
 name = "scn-sync-relay"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.94"
 license = "Apache-2.0"
@@ -8,7 +8,7 @@ description = "Automerge sync relay for the Shared Computer Network"
 repository = "https://github.com/Z-Space-Society/scn-sync-relay"
 
 [dependencies]
-samod = { version = "0.15", features = ["tokio", "axum"] }
+samod = { version = "0.16", features = ["tokio", "axum"] }
 # The version samod is built on: folder documents are read and written with it.
 automerge = "0.12"
 axum = { version = "0.8", features = ["ws"] }

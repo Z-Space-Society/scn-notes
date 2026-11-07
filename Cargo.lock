@@ -2096,9 +2096,9 @@ dependencies = [
 
 [[package]]
 name = "samod"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a1fcb7ff3c225c4f40348223023acd17f6511ee9c721deba0ee17416286ac28"
+checksum = "de1789ea8e69f0708b21b2927342c21da484eb60cfa491d6cced21bc931a6596"
 dependencies = [
  "async-channel",
  "automerge",
@@ -2118,9 +2118,9 @@ dependencies = [
 
 [[package]]
 name = "samod-core"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "218dfdc3016400d1c44baf553821bb8770a9c143f69f3a26a1c891215b679be7"
+checksum = "d3cdfdd6a295b56df993ebccbd0a224d1f431a72b8c3404209baaa060037027e"
 dependencies = [
  "automerge",
  "base64 0.21.7",
@@ -2173,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "scn-sync-relay"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "automerge",

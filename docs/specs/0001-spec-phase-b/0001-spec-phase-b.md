@@ -327,7 +327,7 @@ samod drop the connection.
 
 ### Z6. Announce policy
 
-The repo is built with `NeverAnnounce`. The relay never offers a document
+The repo is built with announcing off (`NeverAnnounce` before samod 0.16, `ShareConfig::read_write().with_announce(false)` since). The relay never offers a document
 unasked and never asks one peer for a document on behalf of another. Clients
 request the documents their folder documents list. A change still reaches
 every peer that has already synced that document.
