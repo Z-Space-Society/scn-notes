@@ -630,7 +630,7 @@ pub(crate) mod tests {
         store.migrate().await.unwrap();
         let repo = Repo::build_tokio()
             .with_storage(store)
-            .with_announce_policy(samod::NeverAnnounce)
+            .with_share_policy(samod::ShareConfig::read_write().with_announce(false))
             .load()
             .await;
         let authz = Authz::load(pool.clone(), repo.clone()).await.unwrap();

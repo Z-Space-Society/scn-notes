@@ -29,7 +29,7 @@ use axum::{
     routing::{get, put},
     Json, Router,
 };
-use samod::{AcceptorHandle, NeverAnnounce, Repo};
+use samod::{AcceptorHandle, Repo, ShareConfig};
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
 
@@ -164,10 +164,11 @@ async fn open_relay(config: &Config) -> Result<(Repo, Authz)> {
     // The relay never offers a document unasked, and never asks one peer for
     // a document on behalf of another. A peer gets what it requests and may
     // open, and a change still reaches every peer already syncing that
-    // document.
+    // document. Every peer is read-write to samod: who may open what is the
+    // filter's decision, made on each frame before samod sees it.
     let repo = Repo::build_tokio()
         .with_storage(store)
-        .with_announce_policy(NeverAnnounce)
+        .with_share_policy(ShareConfig::read_write().with_announce(false))
         .load()
         .await;
     let authz = Authz::load(pool, repo.clone())
