@@ -17,12 +17,13 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use automerge::{
-    transaction::Transactable, Automerge, AutomergeError, ObjId, ObjType, ReadDoc, TextEncoding,
-    Value, ROOT,
+    transaction::Transactable, ActorId, Automerge, AutomergeError, ObjId, ObjType, ReadDoc,
+    TextEncoding, Value, ROOT,
 };
 use samod::{AutomergeUrl, DocHandle, DocumentId};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::actors::as_actor;
 use crate::auth::Caller;
 use crate::authz::{Authz, PRIVATE, WORKSPACES};
 use crate::reach::{self, Entry, FOLDER, NOTE};
@@ -147,11 +148,28 @@ fn narrow<'a>(old: &'a str, new: &'a str) -> (&'a str, &'a str, &'a str) {
 
 /// A note document: `{"@patchwork": {"type": "file"}, name, extension,
 /// mimeType, content}`, with `content` a text object holding the text exactly.
+#[cfg(test)]
 pub(crate) fn new_note(
     name: &str,
     content: &str,
 ) -> std::result::Result<Automerge, AutomergeError> {
-    let mut doc = Automerge::new();
+    note_in(Automerge::new(), name, content)
+}
+
+/// [`new_note`], written as `actor`.
+fn new_note_by(
+    actor: ActorId,
+    name: &str,
+    content: &str,
+) -> std::result::Result<Automerge, AutomergeError> {
+    note_in(Automerge::new().with_actor(actor), name, content)
+}
+
+fn note_in(
+    mut doc: Automerge,
+    name: &str,
+    content: &str,
+) -> std::result::Result<Automerge, AutomergeError> {
     let mut tx = doc.transaction();
     let patchwork = tx.put_object(ROOT, "@patchwork", ObjType::Map)?;
     reach::put_string(&mut tx, &patchwork, "type", "file")?;
@@ -390,6 +408,12 @@ impl Notes<'_> {
         }
     }
 
+    /// The actor the caller's edits are written under, so history shows them
+    /// as the caller's rather than the relay's.
+    async fn actor(&self) -> Result<ActorId> {
+        Ok(self.authz.mcp_actor(&self.caller.did).await?)
+    }
+
     /// Store a new document as the caller's and return its URL.
     async fn store(&self, doc: Automerge) -> Result<String> {
         let handle = self
@@ -411,9 +435,12 @@ impl Notes<'_> {
             kind: kind.to_string(),
             url,
         };
+        let actor = self.actor().await?;
         self.open(folder)
             .await?
-            .with_document_async(move |doc| reach::add_entry(doc, &entry))
+            .with_document_async(move |doc| {
+                as_actor(doc, actor, |doc| reach::add_entry(doc, &entry))
+            })
             .await
             .map_err(|_| anyhow::anyhow!("repo stopped"))??;
         Ok(())
@@ -457,7 +484,9 @@ impl Notes<'_> {
                 }
                 None => {
                     let name = new_name(part)?;
-                    let url = self.store(reach::new_folder(&name)?).await?;
+                    let url = self
+                        .store(reach::new_folder_by(self.actor().await?, &name)?)
+                        .await?;
                     self.link(&folder, name, FOLDER, url.clone()).await?;
                     AutomergeUrl::from_str(&url)
                         .map_err(|e| anyhow::anyhow!("{e:?}"))?
@@ -474,7 +503,9 @@ impl Notes<'_> {
         }
         // The note first, then its entry: an entry is never left pointing at
         // a document that does not exist.
-        let url = self.store(new_note(&file, content)?).await?;
+        let url = self
+            .store(new_note_by(self.actor().await?, &file, content)?)
+            .await?;
         self.link(&folder, file.clone(), NOTE, url).await?;
 
         Ok(if at.is_empty() {
@@ -503,35 +534,38 @@ impl Notes<'_> {
         if old == new {
             return refuse("old_text and new_text are the same");
         }
+        let actor = self.actor().await?;
         self.note(root, path)
             .await?
             .with_document_async(move |doc| {
-                let content = content_of(doc)?;
-                let text = doc.text(&content)?;
-                let matches: Vec<usize> = text.match_indices(&old).map(|(at, _)| at).collect();
-                match matches.len() {
-                    0 => return refuse("old_text was not found in the note"),
-                    1 => {}
-                    n if !replace_all => {
-                        return refuse(format!(
-                            "old_text matches {n} places; include more of the surrounding \
+                as_actor(doc, actor, |doc| {
+                    let content = content_of(doc)?;
+                    let text = doc.text(&content)?;
+                    let matches: Vec<usize> = text.match_indices(&old).map(|(at, _)| at).collect();
+                    match matches.len() {
+                        0 => return refuse("old_text was not found in the note"),
+                        1 => {}
+                        n if !replace_all => {
+                            return refuse(format!(
+                                "old_text matches {n} places; include more of the surrounding \
                              text, or set replace_all"
-                        ));
+                            ));
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
 
-                let encoding = doc.text_encoding();
-                let (prefix, old_middle, new_middle) = narrow(&old, &new);
-                let mut tx = doc.transaction();
-                // Last match first, so the positions of the earlier ones hold.
-                for at in matches.iter().rev() {
-                    let position = width(encoding, &text[..*at]) + width(encoding, prefix);
-                    let delete = width(encoding, old_middle) as isize;
-                    tx.splice_text(&content, position, delete, new_middle)?;
-                }
-                tx.commit();
-                Ok(matches.len())
+                    let encoding = doc.text_encoding();
+                    let (prefix, old_middle, new_middle) = narrow(&old, &new);
+                    let mut tx = doc.transaction();
+                    // Last match first, so the positions of the earlier ones hold.
+                    for at in matches.iter().rev() {
+                        let position = width(encoding, &text[..*at]) + width(encoding, prefix);
+                        let delete = width(encoding, old_middle) as isize;
+                        tx.splice_text(&content, position, delete, new_middle)?;
+                    }
+                    tx.commit();
+                    Ok(matches.len())
+                })
             })
             .await
             .map_err(|_| anyhow::anyhow!("repo stopped"))?
@@ -542,21 +576,24 @@ impl Notes<'_> {
         if text.is_empty() {
             return refuse("text is empty");
         }
+        let actor = self.actor().await?;
         self.note(root, path)
             .await?
             .with_document_async(move |doc| {
-                let content = content_of(doc)?;
-                let existing = doc.text(&content)?;
-                let separator = if existing.is_empty() || existing.ends_with('\n') {
-                    ""
-                } else {
-                    "\n"
-                };
-                let end = doc.length(&content);
-                let mut tx = doc.transaction();
-                tx.splice_text(&content, end, 0, &format!("{separator}{text}"))?;
-                tx.commit();
-                Ok(())
+                as_actor(doc, actor, |doc| {
+                    let content = content_of(doc)?;
+                    let existing = doc.text(&content)?;
+                    let separator = if existing.is_empty() || existing.ends_with('\n') {
+                        ""
+                    } else {
+                        "\n"
+                    };
+                    let end = doc.length(&content);
+                    let mut tx = doc.transaction();
+                    tx.splice_text(&content, end, 0, &format!("{separator}{text}"))?;
+                    tx.commit();
+                    Ok(())
+                })
             })
             .await
             .map_err(|_| anyhow::anyhow!("repo stopped"))?

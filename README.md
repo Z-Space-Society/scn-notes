@@ -27,6 +27,15 @@ member's own vaults and their workspaces' vaults.
   takes effect within one token lifetime.
 - **MCP is built in.** A second listener serves the member's notes to an MCP
   client, acting as that member, from the same documents sync uses.
+- **Each change is traced to a member.** Automerge stamps every change with a
+  random actor ID, and the JS client picks a new one each time it opens a
+  note, so an actor is one note on one device for one session. The relay
+  records which member each actor belongs to when its first new change
+  arrives on that member's connection. A change under an actor another member
+  owns is dropped. MCP edits are written under an actor of the member's own.
+  History stored before v0.6.0 is mapped once at startup: a note's first
+  change goes to whoever created it, and every change in a private vault to
+  its owner.
 
 What this does not do:
 
@@ -37,6 +46,12 @@ What this does not do:
   both sets of characters interleaved.
 - **It is not end-to-end encrypted.** The relay, and so its operators, can
   read every note. Notes sit in plaintext in Postgres.
+- **It cannot name every past author.** Edits made before v0.6.0 to workspace
+  notes, other than each note's first change, stay unknown. Before v0.6.0 an
+  MCP edit was written under the relay's actor for that note until the next
+  restart, so when MCP created a note, other members' MCP edits to it in
+  that time are traced to its creator. A note moved into a private vault from a workspace has its
+  other members' earlier edits traced to the owner.
 
 The design is in [`docs/specs/0001-spec-phase-b`](docs/specs/0001-spec-phase-b/0001-spec-phase-b.md).
 

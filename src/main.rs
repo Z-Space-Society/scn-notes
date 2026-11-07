@@ -4,6 +4,7 @@
 //! Postgres. A connection is authenticated as a member's DID before the
 //! websocket upgrade; see `auth.rs` and [`build_verifier`].
 
+mod actors;
 mod auth;
 mod authz;
 mod config;
@@ -75,6 +76,7 @@ async fn main() -> Result<()> {
 
     let verifier = build_verifier(&config).await?;
     let (repo, authz) = open_relay(&config).await?;
+    authz.start_actor_backfill();
 
     // The URL is used only to identify this endpoint in samod's own logs; it
     // is not something the relay binds or dials.

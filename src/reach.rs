@@ -18,7 +18,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use automerge::{transaction::Transactable, Automerge, AutomergeError, ObjType, ReadDoc, ROOT};
+use automerge::{
+    transaction::Transactable, ActorId, Automerge, AutomergeError, ObjType, ReadDoc, ROOT,
+};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use samod::{AutomergeUrl, DocHandle, DocumentId};
@@ -191,7 +193,15 @@ pub(crate) fn read_entries(doc: &Automerge) -> Vec<Entry> {
 /// Strings are written as text objects, the way the JS client writes them, so
 /// a client reads the same shape whichever side made the folder.
 pub(crate) fn new_folder(title: &str) -> Result<Automerge, AutomergeError> {
-    let mut doc = Automerge::new();
+    folder_in(Automerge::new(), title)
+}
+
+/// [`new_folder`], written as `actor`.
+pub(crate) fn new_folder_by(actor: ActorId, title: &str) -> Result<Automerge, AutomergeError> {
+    folder_in(Automerge::new().with_actor(actor), title)
+}
+
+fn folder_in(mut doc: Automerge, title: &str) -> Result<Automerge, AutomergeError> {
     let mut tx = doc.transaction();
     let patchwork = tx.put_object(ROOT, "@patchwork", ObjType::Map)?;
     put_string(&mut tx, &patchwork, "type", FOLDER)?;
