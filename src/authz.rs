@@ -30,6 +30,7 @@ use samod::{DocumentId, Repo};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 
+use crate::actors::Actors;
 use crate::auth::{Caller, Did};
 use crate::reach;
 
@@ -41,6 +42,7 @@ pub(crate) struct Inner {
     pub(crate) repo: Repo,
     pub(crate) creators: RwLock<HashMap<DocumentId, Caller>>,
     pub(crate) reach: RwLock<reach::Index>,
+    pub(crate) actors: RwLock<Actors>,
 }
 
 /// Who a vault belongs to.
@@ -220,11 +222,14 @@ impl Authz {
             }
         }
 
+        let actors = Self::load_actors(&pool).await?;
+
         let authz = Self(Arc::new(Inner {
             pool,
             repo,
             creators: RwLock::new(creators),
             reach: RwLock::new(reach::Index::default()),
+            actors: RwLock::new(actors),
         }));
 
         for row in
@@ -600,6 +605,21 @@ async fn migrate(pool: &PgPool) -> Result<(), sqlx::Error> {
         // existed then.
         "ALTER TABLE doc_creators
              ADD COLUMN IF NOT EXISTS workspaces TEXT[] NOT NULL DEFAULT '{}'",
+        // Who each Automerge actor belongs to; see `actors.rs`.
+        "CREATE TABLE IF NOT EXISTS actor_members (
+             actor_id      TEXT PRIMARY KEY,
+             did           TEXT NOT NULL,
+             source        TEXT NOT NULL,
+             first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+         )",
+        // One MCP actor per member.
+        "CREATE UNIQUE INDEX IF NOT EXISTS actor_members_mcp
+             ON actor_members (did) WHERE source = 'mcp'",
+        // One-off jobs that have run, such as the actor backfill.
+        "CREATE TABLE IF NOT EXISTS relay_jobs (
+             name    TEXT PRIMARY KEY,
+             done_at TIMESTAMPTZ NOT NULL DEFAULT now()
+         )",
     ] {
         sqlx::query(statement).execute(pool).await?;
     }

@@ -1,8 +1,10 @@
 //! Just enough of the sync protocol to know which document a frame is about.
 //!
-//! Each frame is a CBOR map with string keys. The filter needs four of them:
-//! `type`, `senderId`, `targetId` and `documentId`. Everything else is skipped
-//! unread and the frame is forwarded, or not, as the bytes it arrived as.
+//! Each frame is a CBOR map with string keys. The filter needs five of them:
+//! `type`, `senderId`, `targetId`, `documentId`, and `data`, the Automerge
+//! sync message a `sync` or `request` frame carries, which is read for who
+//! made its changes. Everything else is skipped unread and the frame is
+//! forwarded, or not, as the bytes it arrived as.
 //!
 //! samod has its own decoder for these frames and does not export it. This
 //! reader has to agree with that one about which document a frame names,
@@ -19,6 +21,7 @@ pub struct Envelope {
     pub sender_id: Option<String>,
     pub target_id: Option<String>,
     pub document_id: Option<DocumentId>,
+    pub data: Option<Vec<u8>>,
 }
 
 /// Read a frame's envelope, or `None` if it is not one this reader accepts.
@@ -30,6 +33,7 @@ pub fn read(frame: &[u8]) -> Option<Envelope> {
     let mut sender_id = None;
     let mut target_id = None;
     let mut document_id = None;
+    let mut data = None;
 
     for _ in 0..len {
         match decoder.str().ok()? {
@@ -46,6 +50,12 @@ pub fn read(frame: &[u8]) -> Option<Envelope> {
                 };
                 set_once(&mut document_id, id)?;
             }
+            // Bytes in every frame that carries it. Anything else is skipped
+            // as before this was read, so no frame the filter passed until
+            // now is refused for it.
+            "data" if decoder.probe().bytes().is_ok() => {
+                set_once(&mut data, decoder.bytes().ok()?.to_vec())?
+            }
             _ => decoder.skip().ok()?,
         }
     }
@@ -55,6 +65,7 @@ pub fn read(frame: &[u8]) -> Option<Envelope> {
         sender_id,
         target_id,
         document_id,
+        data,
     })
 }
 
@@ -95,6 +106,21 @@ pub(crate) mod tests {
     /// A frame from the client to the relay, shaped as samod and the JS client
     /// send them: the envelope plus a payload the filter never reads.
     pub fn frame(kind: &str, document_id: Option<&DocumentId>) -> Vec<u8> {
+        frame_with(kind, document_id, &empty_sync())
+    }
+
+    /// A sync message carrying no changes: what a client with nothing new
+    /// sends.
+    pub fn empty_sync() -> Vec<u8> {
+        use automerge::sync::{State, SyncDoc};
+        automerge::Automerge::new()
+            .generate_sync_message(&mut State::new())
+            .unwrap()
+            .encode()
+    }
+
+    /// [`frame`] carrying `data`, such as an encoded sync message.
+    pub fn frame_with(kind: &str, document_id: Option<&DocumentId>, data: &[u8]) -> Vec<u8> {
         let mut e = minicbor::Encoder::new(Vec::new());
         e.map(if document_id.is_some() { 5 } else { 4 }).unwrap();
         e.str("type").unwrap().str(kind).unwrap();
@@ -103,7 +129,7 @@ pub(crate) mod tests {
         if let Some(id) = document_id {
             e.str("documentId").unwrap().str(&id.to_string()).unwrap();
         }
-        e.str("data").unwrap().bytes(&[1, 2, 3]).unwrap();
+        e.str("data").unwrap().bytes(data).unwrap();
         e.into_writer()
     }
 
@@ -121,6 +147,7 @@ pub(crate) mod tests {
                 sender_id: Some(CLIENT.to_string()),
                 target_id: Some(RELAY.to_string()),
                 document_id: Some(id),
+                data: Some(empty_sync()),
             })
         );
         assert_eq!(read(&frame("leave", None)).unwrap().document_id, None);
@@ -146,8 +173,19 @@ pub(crate) mod tests {
                 sender_id: Some(RELAY.to_string()),
                 target_id: Some(CLIENT.to_string()),
                 document_id: Some(id),
+                data: None,
             })
         );
+    }
+
+    #[test]
+    fn refuses_a_repeated_data_key() {
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.map(3).unwrap();
+        e.str("type").unwrap().str("sync").unwrap();
+        e.str("data").unwrap().bytes(&[1]).unwrap();
+        e.str("data").unwrap().bytes(&[2]).unwrap();
+        assert_eq!(read(&e.into_writer()), None);
     }
 
     #[test]

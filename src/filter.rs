@@ -17,6 +17,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::{channel::mpsc, SinkExt, StreamExt};
 use samod::{AcceptorHandle, Transport};
 
+use crate::actors::Verdict;
 use crate::auth::Caller;
 use crate::authz::Authz;
 use crate::wire;
@@ -84,18 +85,42 @@ impl Filter {
                         false
                     }
                 };
-                if allowed {
-                    return Inbound::Pass;
+                // Addressed back the way the frame came, and the same answer a
+                // document that does not exist gets.
+                let deny = || {
+                    Inbound::Deny(wire::doc_unavailable(
+                        envelope.target_id.as_deref().unwrap_or_default(),
+                        envelope.sender_id.as_deref().unwrap_or_default(),
+                        &doc,
+                    ))
+                };
+                // No log line: a peer asking for a document it may not have is
+                // ordinary.
+                if !allowed {
+                    return deny();
                 }
 
-                // Addressed back the way the frame came. No log line: a peer
-                // asking for a document it may not have is ordinary, and is
-                // answered exactly as a document that does not exist.
-                Inbound::Deny(wire::doc_unavailable(
-                    envelope.target_id.as_deref().unwrap_or_default(),
-                    envelope.sender_id.as_deref().unwrap_or_default(),
-                    &doc,
-                ))
+                // Who made the changes it carries. If that cannot be
+                // recorded, the changes do not get in.
+                let data = match (envelope.kind.as_str(), envelope.data.as_deref()) {
+                    ("sync" | "request", Some(data)) => data,
+                    _ => return Inbound::Pass,
+                };
+                match self.authz.record_actors(&doc, &self.caller, data).await {
+                    Ok(Verdict::Pass) => Inbound::Pass,
+                    Ok(Verdict::Forged) => {
+                        tracing::warn!(did = %self.caller.did, %doc, "dropping a change under another member's actor");
+                        Inbound::Drop
+                    }
+                    Ok(Verdict::Unreadable) => {
+                        tracing::warn!(did = %self.caller.did, %doc, "dropping a frame whose sync message does not decode");
+                        Inbound::Drop
+                    }
+                    Err(e) => {
+                        tracing::error!(did = %self.caller.did, %doc, error = %e, "could not record who made a document's changes");
+                        deny()
+                    }
+                }
             }
 
             // What other peers hold is not this peer's to announce or learn.
