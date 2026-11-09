@@ -1,4 +1,4 @@
-//! `scn-sync-relay file-unfiled`: a member's documents that no vault reaches,
+//! `scn-notes file-unfiled`: a member's documents that no vault reaches,
 //! listed, and on request linked back into their private vault.
 //!
 //! A document drops out of every vault when its last entry goes: a note or
