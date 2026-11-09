@@ -8,6 +8,7 @@
 //! and a tool call returns one JSON body. A relay restart therefore needs
 //! nothing from the client.
 
+mod history;
 pub(crate) mod notes;
 mod search;
 mod tools;

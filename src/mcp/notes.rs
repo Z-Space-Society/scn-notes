@@ -25,6 +25,7 @@ use automerge::{
 use samod::{AutomergeUrl, DocHandle, DocumentId};
 use unicode_normalization::UnicodeNormalization;
 
+use super::history::{self, History};
 use crate::actors::as_actor;
 use crate::auth::Caller;
 use crate::authz::{Authz, Workspace, PRIVATE, WORKSPACES};
@@ -45,11 +46,11 @@ impl<E: Into<anyhow::Error>> From<E> for NoteError {
     }
 }
 
-fn refuse<T>(why: impl Into<String>) -> Result<T> {
+pub(super) fn refuse<T>(why: impl Into<String>) -> Result<T> {
     Err(NoteError::Refused(why.into()))
 }
 
-type Result<T> = std::result::Result<T, NoteError>;
+pub(super) type Result<T> = std::result::Result<T, NoteError>;
 
 /// The most entries a recursive listing or a search will walk.
 const MAX_WALK: usize = 20_000;
@@ -227,7 +228,7 @@ fn note_in(
     reach::put_string(&mut tx, &ROOT, "extension", NOTE)?;
     reach::put_string(&mut tx, &ROOT, "mimeType", "text/markdown")?;
     reach::put_string(&mut tx, &ROOT, "content", content)?;
-    tx.commit();
+    tx.commit_with(reach::stamped());
     Ok(doc)
 }
 
@@ -528,6 +529,42 @@ impl Notes<'_> {
         }
     }
 
+    /// A note's history: its changes with no version, its text at one
+    /// version, or what changed between two. Reached the way [`Notes::read`]
+    /// reaches a note, with the same checks.
+    pub async fn history(
+        &self,
+        root: &DocumentId,
+        path: &str,
+        version: Option<String>,
+        compare_to: Option<String>,
+        limit: usize,
+    ) -> Result<History> {
+        self.note(root, path)
+            .await?
+            .with_document_async(move |doc| {
+                let doc = &*doc;
+                match (version, compare_to) {
+                    (None, None) => {
+                        let (groups, more) = history::groups(doc, limit)?;
+                        Ok(History::Changes { groups, more })
+                    }
+                    (Some(at), None) => Ok(History::Text(history::text_at(
+                        doc,
+                        history::version(doc, &at)?,
+                    )?)),
+                    (Some(a), Some(b)) => Ok(History::Diff(history::diff(
+                        doc,
+                        history::version(doc, &a)?,
+                        history::version(doc, &b)?,
+                    )?)),
+                    (None, Some(_)) => refuse("compare_to needs a version to compare it with"),
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("repo stopped"))?
+    }
+
     /// The actor the caller's edits are written under, so history shows them
     /// as the caller's rather than the relay's.
     async fn actor(&self) -> Result<ActorId> {
@@ -683,7 +720,7 @@ impl Notes<'_> {
                         let delete = width(encoding, old_middle) as isize;
                         tx.splice_text(&content, position, delete, new_middle)?;
                     }
-                    tx.commit();
+                    tx.commit_with(reach::stamped());
                     Ok(matches.len())
                 })
             })
@@ -711,7 +748,7 @@ impl Notes<'_> {
                     let end = doc.length(&content);
                     let mut tx = doc.transaction();
                     tx.splice_text(&content, end, 0, &format!("{separator}{text}"))?;
-                    tx.commit();
+                    tx.commit_with(reach::stamped());
                     Ok(())
                 })
             })

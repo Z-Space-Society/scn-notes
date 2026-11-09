@@ -14,6 +14,7 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::json;
 
+use super::history::History;
 use super::notes::{NoteError, Notes};
 use super::search;
 use crate::auth::Caller;
@@ -21,6 +22,8 @@ use crate::authz::Authz;
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 50;
+const DEFAULT_HISTORY_LIMIT: usize = 20;
+const MAX_HISTORY_LIMIT: usize = 100;
 
 #[derive(Clone)]
 pub struct NotesServer {
@@ -89,6 +92,21 @@ pub struct AppendNote {
     path: String,
     /// The text to add. It starts on a new line.
     text: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct NoteHistory {
+    /// Path of the note, starting with its workspace: "Private/plan.md" for
+    /// your own, "Workspaces/<name>/plan.md" for a shared one.
+    path: String,
+    /// A change's id from this tool's listing. Alone, returns the note's text
+    /// as that change left it; to restore it, create a new note from that
+    /// text. With compare_to, the start of a diff.
+    version: Option<String>,
+    /// A second change id: returns what changed from version to this one.
+    compare_to: Option<String>,
+    /// The most groups of changes to list. Defaults to 20, at most 100.
+    limit: Option<usize>,
 }
 
 fn said(text: impl Into<String>) -> Result<CallToolResult, ErrorData> {
@@ -180,6 +198,67 @@ impl NotesServer {
         };
         match text.await {
             Ok(text) => said(text),
+            Err(e) => failed(e),
+        }
+    }
+
+    #[tool(
+        description = "A note's history. With no version: its changes, newest first, grouped \
+                       by session, each with the member's DID (or \"unknown\"), the device's \
+                       time, and characters added and removed. With version: the note's text \
+                       as that change left it, removed text included. With version and \
+                       compare_to: the text removed and added between them. Times are as each \
+                       device's clock reported them. This never changes the note.",
+        annotations(title = "Note history", read_only_hint = true)
+    )]
+    async fn note_history(
+        &self,
+        Parameters(args): Parameters<NoteHistory>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let caller = caller(&parts)?;
+        let notes = Notes {
+            authz: &self.authz,
+            caller: &caller,
+        };
+        let limit = args
+            .limit
+            .unwrap_or(DEFAULT_HISTORY_LIMIT)
+            .clamp(1, MAX_HISTORY_LIMIT);
+        let path = args.path.clone();
+        let history = async {
+            let at = notes.locate(&args.path).await?;
+            notes
+                .history(&at.root, &at.rest, args.version, args.compare_to, limit)
+                .await
+        };
+        let time = |t: Option<chrono::DateTime<chrono::Utc>>| t.map(|t| t.to_rfc3339());
+        match history.await {
+            Ok(History::Changes { groups, more }) => listed(json!({
+                "path": path,
+                "times": "as each device's clock reported them",
+                "groups": groups.iter().map(|group| json!({
+                    "id": group.id.to_string(),
+                    "did": self
+                        .authz
+                        .actor_owner(&group.actor)
+                        .map_or_else(|| "unknown".to_string(), |did| did.0),
+                    "device_time": { "from": time(group.from), "to": time(group.to) },
+                    "added": group.added,
+                    "removed": group.removed,
+                    "changes": group.changes,
+                })).collect::<Vec<_>>(),
+                "more": more,
+            })),
+            Ok(History::Text(text)) => said(text),
+            Ok(History::Diff(hunks)) => listed(json!(hunks
+                .iter()
+                .map(|hunk| json!({
+                    "line": hunk.line,
+                    "removed": hunk.removed,
+                    "added": hunk.added,
+                }))
+                .collect::<Vec<_>>())),
             Err(e) => failed(e),
         }
     }

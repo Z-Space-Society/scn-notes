@@ -203,13 +203,19 @@ pub(crate) fn new_folder_by(actor: ActorId, title: &str) -> Result<Automerge, Au
     folder_in(Automerge::new().with_actor(actor), title)
 }
 
+/// Commit options that stamp the time, so a change the relay writes shows
+/// when it was made in a note's history, as a device's change does.
+pub(crate) fn stamped() -> automerge::transaction::CommitOptions {
+    automerge::transaction::CommitOptions::default().with_time(Utc::now().timestamp())
+}
+
 fn folder_in(mut doc: Automerge, title: &str) -> Result<Automerge, AutomergeError> {
     let mut tx = doc.transaction();
     let patchwork = tx.put_object(ROOT, "@patchwork", ObjType::Map)?;
     put_string(&mut tx, &patchwork, "type", FOLDER)?;
     put_string(&mut tx, &ROOT, "title", title)?;
     tx.put_object(ROOT, "docs", ObjType::List)?;
-    tx.commit();
+    tx.commit_with(stamped());
     Ok(doc)
 }
 
@@ -223,7 +229,7 @@ pub(crate) fn add_entry(doc: &mut Automerge, entry: &Entry) -> Result<(), Autome
     put_string(&mut tx, &item, "name", &entry.name)?;
     put_string(&mut tx, &item, "type", &entry.kind)?;
     put_string(&mut tx, &item, "url", &entry.url)?;
-    tx.commit();
+    tx.commit_with(stamped());
     Ok(())
 }
 

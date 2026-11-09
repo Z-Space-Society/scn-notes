@@ -310,10 +310,44 @@ guessed between.
 | `create_note` | A new note at a path, with any folders on the way |
 | `edit_note` | Replace one piece of a note's text with another |
 | `append_note` | Add text to the end of a note |
+| `note_history` | A note's changes, its text at an earlier version, or the diff between two versions |
 
 The service is stateless: no session is issued and each request carries its
 own token, so a relay restart needs nothing from the client. There is no tool
 to delete a note.
+
+#### History
+
+`note_history` takes the same path and makes the same checks as `read_note`,
+and never changes the note.
+
+- **With no version**, it lists the note's changes newest first, in groups: a
+  run of changes under one Automerge actor, which is one member's session on
+  one device, or a stretch of their MCP edits. Each group has an `id`, the
+  member's DID, the device's time at its first and last change, and the
+  characters added and removed. `limit` caps the groups (20 by default, at
+  most 100).
+- **With `version`**, one group's `id`, it returns the note's text as that
+  change left it. To restore it, create a new note from that text; nothing
+  rewinds a note in place, since that would discard other members' later
+  work.
+- **With `version` and `compare_to`**, it returns what changed between them:
+  each stretch of removed and added text, with the line it starts on.
+
+A version is the note as one change left it: that change and everything it
+was made on top of, not edits another device made at the same time.
+
+Who made a change comes from the actor map (see [Status](#status-phase-b));
+a change the relay cannot attribute shows as `unknown`, which is most edits
+to shared-workspace notes from before v0.6.0.
+Times are whatever each device's clock said, so they can be wrong or out of
+order. The relay's own MCP edits carry its time from this version on; earlier
+ones have none.
+
+Removed text is shown, not hidden. Every member's device already syncs a
+note's full history, so hiding it would protect nothing, and showing an
+earlier version shows it anyway. Text deleted from a shared note stays
+readable to everyone in that workspace.
 
 ## Storage
 
