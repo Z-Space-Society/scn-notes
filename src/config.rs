@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 
 /// Prefix for every variable this service reads, so nothing it looks at can
 /// collide with something else on the host.
-const PREFIX: &str = "SCN_SYNC_RELAY_";
+const PREFIX: &str = "SCN_NOTES_";
 
 pub struct Config {
     /// Postgres connection string. The only setting with no default: a relay

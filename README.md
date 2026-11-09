@@ -1,6 +1,7 @@
-# scn-sync-relay
+# scn-notes
 
-An Automerge sync relay for the Shared Computer Network. It speaks the
+The service behind SCN Notes on the Shared Computer Network: an Automerge
+sync relay and an MCP server over the same documents. It speaks the
 automerge-repo WebSocket protocol, so a standard `@automerge/automerge-repo`
 client connects to it with nothing changed but a token in the URL, and it
 persists documents to Postgres. It also serves those documents to MCP clients.
@@ -62,16 +63,16 @@ All settings come from the environment; systemd loads them from an
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `SCN_SYNC_RELAY_DATABASE_URL` | *required* | No in-memory fallback: a relay that silently ran on memory would look healthy until its first restart. |
-| `SCN_SYNC_RELAY_BIND` | `0.0.0.0:7030` | Sync and the vault endpoints. Bind a wildcard. Binding a literal container address loses a cold-boot race with `systemd-networkd` and comes up loopback-only. |
-| `SCN_SYNC_RELAY_REQUIRE_AUTH` | `true` | Defaults on, so the safe posture is the one you get by forgetting. See "Running without auth". |
-| `SCN_SYNC_RELAY_OIDC_ISSUER` | *required with auth* | The `iss` every token must carry: Corliss's public URL, no trailing slash. |
-| `SCN_SYNC_RELAY_OIDC_JWKS_URL` | *required with auth* | Where to fetch Corliss's signing keys. Use its internal address. |
-| `SCN_SYNC_RELAY_SYNC_AUDIENCE` | *required with auth* | The `aud` a sync token must carry: the public sync URL, spelled exactly as Corliss's `OIDC_RESOURCES` spells it. |
-| `SCN_SYNC_RELAY_MCP_AUDIENCE` | *required with auth* | The `aud` an MCP token must carry: the public MCP URL, in lowercase with no trailing slash and no default port. Also the only `Host` the MCP service answers to, and its path is where the service is mounted. |
-| `SCN_SYNC_RELAY_MCP_BIND` | `0.0.0.0:7031` | The MCP listener. |
-| `SCN_SYNC_RELAY_SERVICE_TOKEN` | *required with auth* | The shared credential Corliss presents on `/internal/vaults`. |
-| `RUST_LOG` | `scn_sync_relay=info,samod=info` | Standard `tracing` filter. |
+| `SCN_NOTES_DATABASE_URL` | *required* | No in-memory fallback: a relay that silently ran on memory would look healthy until its first restart. |
+| `SCN_NOTES_BIND` | `0.0.0.0:7030` | Sync and the vault endpoints. Bind a wildcard. Binding a literal container address loses a cold-boot race with `systemd-networkd` and comes up loopback-only. |
+| `SCN_NOTES_REQUIRE_AUTH` | `true` | Defaults on, so the safe posture is the one you get by forgetting. See "Running without auth". |
+| `SCN_NOTES_OIDC_ISSUER` | *required with auth* | The `iss` every token must carry: Corliss's public URL, no trailing slash. |
+| `SCN_NOTES_OIDC_JWKS_URL` | *required with auth* | Where to fetch Corliss's signing keys. Use its internal address. |
+| `SCN_NOTES_SYNC_AUDIENCE` | *required with auth* | The `aud` a sync token must carry: the public sync URL, spelled exactly as Corliss's `OIDC_RESOURCES` spells it. |
+| `SCN_NOTES_MCP_AUDIENCE` | *required with auth* | The `aud` an MCP token must carry: the public MCP URL, in lowercase with no trailing slash and no default port. Also the only `Host` the MCP service answers to, and its path is where the service is mounted. |
+| `SCN_NOTES_MCP_BIND` | `0.0.0.0:7031` | The MCP listener. |
+| `SCN_NOTES_SERVICE_TOKEN` | *required with auth* | The shared credential Corliss presents on `/internal/vaults`. |
+| `RUST_LOG` | `scn_notes=info,samod=info` | Standard `tracing` filter. |
 
 With auth on and any of the required settings missing or blank, the relay
 refuses to start and names the one it wants.
@@ -87,7 +88,7 @@ refuses to start and names the one it wants.
 
 ### Running without auth
 
-`SCN_SYNC_RELAY_REQUIRE_AUTH=false` runs the relay with no verifier and no
+`SCN_NOTES_REQUIRE_AUTH=false` runs the relay with no verifier and no
 filter: any peer that can reach the port can sync any document it holds. It is
 for local work and is only sound where the service has no route in. The MCP
 service is not started in this mode, because there is no member for it to act
@@ -226,7 +227,7 @@ member has two, startup fails rather than merge them silently.
   That is fine at today's size, and it is what to revisit if the admin page
   gets slow.
 
-**Filing a member's unfiled documents.** `scn-sync-relay file-unfiled <did>
+**Filing a member's unfiled documents.** `scn-notes file-unfiled <did>
 [--folder <name>] [--apply | --delete]` lists the documents of `<did>` that no vault
 reaches. With `--apply`, it links them into a new folder (`Recovered` unless
 named) at the root of that member's private vault, where they appear on every
@@ -339,6 +340,16 @@ FROM storage
 WHERE split_part(key, '/', 1) NOT IN (SELECT doc_id FROM doc_creators)
 GROUP BY 1 ORDER BY 2 DESC;
 ```
+
+## Naming
+
+The software was called `scn-sync-relay` before v0.7.0. The software's own
+names follow the crate: the binary, the systemd unit, the unix user, the
+install paths and the `SCN_NOTES_` env prefix are all `scn-notes`. The
+cluster's names for the service keep the old spelling on purpose: the zai-ops
+role `sync_relay`, the `sync-relay` container and its CTID, and the
+`scn_sync_relay` database. Renaming those would touch a recorded container
+assignment and the database that holds the notes, for nothing a member sees.
 
 ## Building
 

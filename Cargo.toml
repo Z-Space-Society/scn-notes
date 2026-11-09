@@ -1,11 +1,11 @@
 [package]
-name = "scn-sync-relay"
+name = "scn-notes"
 version = "0.6.0"
 edition = "2021"
 rust-version = "1.94"
 license = "Apache-2.0"
-description = "Automerge sync relay for the Shared Computer Network"
-repository = "https://github.com/Z-Space-Society/scn-sync-relay"
+description = "SCN Notes: Automerge sync and MCP for the Shared Computer Network"
+repository = "https://github.com/Z-Space-Society/scn-notes"
 
 [dependencies]
 samod = { version = "0.16", features = ["tokio", "axum"] }

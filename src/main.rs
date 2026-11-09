@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "scn_sync_relay=info,samod=info".into()),
+                .unwrap_or_else(|_| "scn_notes=info,samod=info".into()),
         )
         .init();
 
@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         bind = %config.bind,
         auth = verifier.name(),
-        "scn-sync-relay listening"
+        "scn-notes listening"
     );
     let sync = axum::serve(listener, app).with_graceful_shutdown(shutdown());
 
@@ -206,7 +206,7 @@ async fn run_file_unfiled(
     args: &[String],
 ) -> Result<Option<(auth::Did, Vec<unfiled::Orphan>)>> {
     const USAGE: &str =
-        "usage: scn-sync-relay file-unfiled <did> [--folder <name>] [--apply | --delete]";
+        "usage: scn-notes file-unfiled <did> [--folder <name>] [--apply | --delete]";
     let mut did = None;
     let mut folder = "Recovered".to_string();
     let mut apply = false;
@@ -1275,7 +1275,7 @@ mod tests {
         // Stateless: no session to carry into the next request.
         assert!(response.headers().get("mcp-session-id").is_none());
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["result"]["serverInfo"]["name"], "scn-sync-relay");
+        assert_eq!(body["result"]["serverInfo"]["name"], "scn-notes");
 
         let body: Value = relay
             .rpc(Some(&token), "tools/list", json!({}))

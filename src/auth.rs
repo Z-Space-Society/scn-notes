@@ -121,7 +121,7 @@ pub trait DidVerifier: Send + Sync + 'static {
 /// will sync any document id it holds to anyone who can reach the port. It is
 /// only sound while the service has no route through the proxy and holds
 /// nothing real. `main` refuses to select it unless the operator has explicitly
-/// set `SCN_SYNC_RELAY_REQUIRE_AUTH=false`.
+/// set `SCN_NOTES_REQUIRE_AUTH=false`.
 pub struct AllowAll;
 
 /// Deliberately not a syntactically valid DID, so it can never be mistaken for

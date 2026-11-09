@@ -2172,7 +2172,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "scn-sync-relay"
+name = "scn-notes"
 version = "0.6.0"
 dependencies = [
  "anyhow",
