@@ -1250,7 +1250,7 @@ mod tests {
         let response = rpc(Some(relay.notes_mcp_token(ALICE))).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 6);
+        assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 7);
 
         // The plugin's token is not an MCP token, and a refusal says where to
         // find the issuer.
@@ -1634,6 +1634,87 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn note_history_lists_changes_by_member_and_reads_old_versions(pool: PgPool) {
+        let relay = start(&pool).await;
+        relay
+            .authz
+            .group_workspace(&auth::Did(ALICE.into()), "7", "Garden")
+            .await
+            .unwrap();
+        let in_7 = ["7"];
+        let path = "Workspaces/Garden/plan.md";
+        let (is_error, text) = relay
+            .call_in(
+                ALICE,
+                &in_7,
+                "create_note",
+                json!({ "path": path, "content": "dig beds" }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+
+        // Bob can reach it once the index has walked the folder.
+        let mut edited = false;
+        for _ in 0..200 {
+            let (is_error, _) = relay
+                .call_in(
+                    BOB,
+                    &in_7,
+                    "edit_note",
+                    json!({ "path": path, "old_text": "dig", "new_text": "rake" }),
+                )
+                .await;
+            if !is_error {
+                edited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(edited, "Bob never reached the shared note");
+
+        let history = |arguments: Value| {
+            let relay = &relay;
+            async move {
+                let (is_error, text) = relay.call_in(ALICE, &in_7, "note_history", arguments).await;
+                assert!(!is_error, "{text}");
+                text
+            }
+        };
+        let listing: Value = serde_json::from_str(&history(json!({ "path": path })).await).unwrap();
+        let groups = listing["groups"].as_array().unwrap();
+        assert_eq!(groups[0]["did"], BOB);
+        assert_eq!(groups[1]["did"], ALICE);
+        assert!(groups[0]["device_time"]["to"].is_string());
+        assert_eq!(listing["more"], false);
+        let (bobs, alices) = (
+            groups[0]["id"].as_str().unwrap(),
+            groups[1]["id"].as_str().unwrap(),
+        );
+
+        assert_eq!(
+            history(json!({ "path": path, "version": alices })).await,
+            "dig beds"
+        );
+        let hunks: Value = serde_json::from_str(
+            &history(json!({ "path": path, "version": alices, "compare_to": bobs })).await,
+        )
+        .unwrap();
+        assert_eq!(hunks[0]["removed"], "dig");
+        assert_eq!(hunks[0]["added"], "rake");
+
+        // Nothing changed the note.
+        let (_, text) = relay
+            .call_in(ALICE, &in_7, "read_note", json!({ "path": path }))
+            .await;
+        assert_eq!(text, "rake beds");
+
+        // Without the group, there is no such note to give a history of.
+        relay
+            .refused(BOB, "note_history", json!({ "path": path }))
+            .await;
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn the_sync_listener_names_its_issuer(pool: PgPool) {
         let relay = start(&pool).await;
         let metadata: Value = reqwest::get(format!(
@@ -1698,6 +1779,7 @@ mod tests {
                 "create_note",
                 "edit_note",
                 "list_notes",
+                "note_history",
                 "read_note",
                 "search_notes"
             ]
@@ -1958,6 +2040,9 @@ mod tests {
         relay
             .refused(BOB, "read_note", json!({ "path": "Private/secret.md" }))
             .await;
+        relay
+            .refused(BOB, "note_history", json!({ "path": "Private/secret.md" }))
+            .await;
         assert!(paths(
             &relay
                 .ok(BOB, "search_notes", json!({ "query": "alice" }))
@@ -1998,6 +2083,9 @@ mod tests {
         .is_empty());
         relay
             .refused(BOB, "read_note", json!({ "path": "Private/stolen.md" }))
+            .await;
+        relay
+            .refused(BOB, "note_history", json!({ "path": "Private/stolen.md" }))
             .await;
         relay
             .refused(
