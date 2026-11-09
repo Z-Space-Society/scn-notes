@@ -83,17 +83,22 @@ pub fn router(
                 .with_legacy_session_mode(false)
                 .with_json_response(true),
         );
+    let auth = middleware::from_fn_with_state(state.clone(), authenticate);
+    // Mounted at the root, MCP answers every path, so every path is
+    // authenticated. Mounted at a path, only that path is: `layer` would wrap
+    // the fallback too, and a host this is merged into would answer a path it
+    // does not serve with `401` instead of `404`.
     let protected = if path.is_empty() {
-        Router::new().fallback_service(service)
+        Router::new().fallback_service(service).layer(auth)
     } else {
-        Router::new().nest_service(path, service)
-    }
-    .layer(middleware::from_fn_with_state(state.clone(), authenticate));
+        Router::new().nest_service(path, service).route_layer(auth)
+    };
 
-    let mut open = Router::new().route(METADATA_PATH, get(metadata));
-    if !path.is_empty() {
-        open = open.route(&format!("{METADATA_PATH}{path}"), get(metadata));
-    }
+    // RFC 9728: the metadata for a resource with a path sits at the
+    // well-known path with that path after it. The root document is this
+    // resource's only when it is mounted at the root; on the `notes.` host the
+    // root document describes the plugin's resource instead.
+    let open = Router::new().route(&format!("{METADATA_PATH}{path}"), get(metadata));
     Ok(open.with_state(state).merge(protected))
 }
 

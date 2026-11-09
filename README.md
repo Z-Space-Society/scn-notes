@@ -72,13 +72,15 @@ All settings come from the environment; systemd loads them from an
 | `SCN_NOTES_SYNC_AUDIENCE` | *required with auth* | The `aud` a sync token must carry: the public sync URL, spelled exactly as Corliss's `OIDC_RESOURCES` spells it. |
 | `SCN_NOTES_MCP_AUDIENCE` | *required with auth* | The `aud` an MCP token must carry: the public MCP URL, in lowercase with no trailing slash and no default port. Also the only `Host` the MCP service answers to, and its path is where the service is mounted. |
 | `SCN_NOTES_MCP_BIND` | `0.0.0.0:7031` | The MCP listener. |
+| `SCN_NOTES_PUBLIC_URL` | *required with auth* | The public URL of the `notes.` host: an origin with no path and no trailing slash, such as `https://notes.example.org`. A plugin's token there carries it as `aud`, and an MCP client's carries it with `/mcp` after it. The relay refuses to start on anything with a path or a trailing slash. |
+| `SCN_NOTES_PUBLIC_BIND` | `0.0.0.0:7032` | The `notes.` listener. |
 | `SCN_NOTES_SERVICE_TOKEN` | *required with auth* | The shared credential Corliss presents on `/internal/`. |
 | `RUST_LOG` | `scn_notes=info,samod=info` | Standard `tracing` filter. |
 
 With auth on and any of the required settings missing or blank, the relay
 refuses to start and names the one it wants.
 
-- **The two audiences must match Corliss character for character.** A token
+- **The audiences must match Corliss character for character.** A token
   whose `aud` differs by a trailing slash is refused, and the only symptom is
   a `401`. Define each URL once in the deployment and render it to both
   services.
@@ -96,6 +98,31 @@ service is not started in this mode, because there is no member for it to act
 as.
 
 ## Endpoints
+
+Three listeners while the old hosts are still served. From v0.7.0 members'
+clients use the `notes.` listener; the sync and MCP listeners serve the old
+`sync.` and `mcp.` hosts until they retire
+([#19](https://github.com/Z-Space-Society/scn-notes/issues/19)). After that the
+sync listener serves `/internal/` and `/health` only, with no public route.
+
+On the `notes.` listener (`PUBLIC_BIND`), everything a member's clients reach:
+
+| Path | Caller | Purpose |
+| --- | --- | --- |
+| `POST /mcp` | MCP client | MCP over Streamable HTTP. `Authorization: Bearer` with a token whose `aud` is `PUBLIC_URL/mcp`. Not versioned in the path: MCP agrees its protocol version when a client connects, and clients read the tool list each session. |
+| `GET /v1/sync` | plugin | WebSocket upgrade; the automerge-repo sync protocol. The token rides in the query, `?access_token=`, with `PUBLIC_URL` as its `aud`. |
+| `GET /v1/workspaces` | plugin | The caller's workspaces, as `{"workspaces", "root_folders"}`. Makes the Private workspace if they have none yet. `Authorization: Bearer` with the same token as `/v1/sync`. |
+| `GET /.well-known/oauth-protected-resource` | anyone | The plugin's resource: `resource` is `PUBLIC_URL`, `authorization_servers` is the issuer. A plugin given only the notes URL finds Corliss here. |
+| `GET /.well-known/oauth-protected-resource/mcp` | anyone | The MCP resource: `resource` is `PUBLIC_URL/mcp`. A refused MCP request points here. |
+| `GET /health` | anyone | Liveness, as on the sync listener. |
+
+- **The base URL and the audiences are never versioned.** The plugin adds the
+  API version it was built for. Inside `/v1/` changes only add things; a
+  breaking change is `/v2/`, served beside `/v1/`, never a change to `/v1/`.
+- **`/` is left free**, for pages if the service ever has any.
+- **Nothing else answers here.** Any other path is a `404`, including the old
+  host's `/` websocket and `/vaults`, and `/internal/` is not served on this
+  listener at all, so the proxy can route the whole host.
 
 On the sync listener (`BIND`):
 
@@ -120,11 +147,13 @@ On the MCP listener (`MCP_BIND`):
 
 Things the proxy in front has to get right:
 
-- **Do not route `/internal/`.** Those endpoints are for Corliss on the
-  internal network. The service token is the only thing guarding them.
-- **Do not log query strings on the sync route.** A browser or phone
+- **Do not route `/internal/` on the `sync.` host.** Those endpoints are for
+  Corliss on the internal network. The service token is the only thing
+  guarding them. The `notes.` listener does not serve them.
+- **Do not log query strings on either sync route.** A browser or phone
   websocket cannot send an `Authorization` header, so a sync client connects
-  to `wss://host/?access_token=<token>`. The relay never logs it.
+  to `wss://host/?access_token=<token>`, or `/v1/sync?access_token=` on the
+  `notes.` host. The relay never logs it.
 
 ### Sync
 

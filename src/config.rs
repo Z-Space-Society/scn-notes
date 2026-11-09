@@ -39,6 +39,10 @@ pub struct Config {
     /// Address the MCP service binds. A listener of its own, so sync and MCP
     /// traffic stay separate in the proxy and in logs.
     pub mcp_bind: String,
+
+    /// Address the public listener binds: the `notes.` host, where members'
+    /// clients reach everything. Not started with auth off.
+    pub public_bind: String,
 }
 
 pub struct AuthConfig {
@@ -59,6 +63,20 @@ pub struct AuthConfig {
     /// Also the `resource` the relay advertises, the host it accepts MCP
     /// requests for, and the path the MCP service is mounted at.
     pub mcp_audience: String,
+
+    /// The public URL of the `notes.` host, an origin with no path and no
+    /// trailing slash, such as `https://notes.example.org`. It is the `aud` a
+    /// plugin's token carries there, and with `/mcp` after it, an MCP
+    /// client's.
+    pub public_url: String,
+}
+
+impl AuthConfig {
+    /// The `aud` an MCP token carries on the `notes.` host, and where MCP is
+    /// mounted there.
+    pub fn public_mcp_url(&self) -> String {
+        format!("{}/mcp", self.public_url)
+    }
 }
 
 impl Config {
@@ -81,6 +99,7 @@ impl Config {
                 oidc_jwks_url: required_for_auth("OIDC_JWKS_URL")?,
                 sync_audience: required_for_auth("SYNC_AUDIENCE")?,
                 mcp_audience: required_for_auth("MCP_AUDIENCE")?,
+                public_url: origin(&required_for_auth("PUBLIC_URL")?)?,
             })
         } else {
             None
@@ -99,6 +118,7 @@ impl Config {
             auth,
             service_token,
             mcp_bind: var("MCP_BIND").unwrap_or_else(|_| "0.0.0.0:7031".to_string()),
+            public_bind: var("PUBLIC_BIND").unwrap_or_else(|_| "0.0.0.0:7032".to_string()),
         })
     }
 }
@@ -117,6 +137,46 @@ fn required_for_auth(name: &str) -> Result<String> {
     }
 }
 
+/// `PUBLIC_URL` as given, once it is checked to be an origin alone. Paths
+/// are added to it (`/mcp`, `/v1/...`), so a trailing slash or a path would
+/// put a doubled slash in an audience, and a token would fail with a bare
+/// `401`.
+fn origin(url: &str) -> Result<String> {
+    let parsed: samod::Url = url
+        .parse()
+        .with_context(|| format!("{PREFIX}PUBLIC_URL is not a URL: {url:?}"))?;
+    anyhow::ensure!(
+        parsed.host_str().is_some()
+            && parsed.path() == "/"
+            && !url.ends_with('/')
+            && parsed.query().is_none(),
+        "{PREFIX}PUBLIC_URL must be an origin with no path and no trailing slash, \
+         such as https://notes.example.org; got {url:?}"
+    );
+    Ok(url.to_string())
+}
+
 fn var(name: &str) -> Result<String, std::env::VarError> {
     std::env::var(format!("{PREFIX}{name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin;
+
+    #[test]
+    fn the_public_url_is_an_origin_alone() {
+        for good in ["https://notes.example.org", "http://127.0.0.1:7032"] {
+            assert_eq!(origin(good).unwrap(), good);
+        }
+        for bad in [
+            "https://notes.example.org/",
+            "https://notes.example.org/mcp",
+            "https://notes.example.org?x=1",
+            "notes.example.org",
+            "",
+        ] {
+            assert!(origin(bad).is_err(), "{bad:?}");
+        }
+    }
 }
