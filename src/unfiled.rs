@@ -1,13 +1,13 @@
-//! `scn-notes file-unfiled`: a member's documents that no vault reaches,
-//! listed, and on request linked back into their private vault.
+//! `scn-notes file-unfiled`: a member's documents that no workspace reaches,
+//! listed, and on request linked back into their private workspace.
 //!
-//! A document drops out of every vault when its last entry goes: a note or
+//! A document drops out of every workspace when its last entry goes: a note or
 //! folder deleted in Obsidian, or a move cut off part way. It stays on the
 //! relay, open only to its creator. This command shows what those are and can
 //! put them in a new folder, where the member sees them on every device.
 //!
 //! It is run by hand with the service stopped, so nothing else is writing the
-//! vault's root folder while it does.
+//! workspace's root folder while it does.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -33,7 +33,7 @@ pub enum Kind {
     Other,
 }
 
-/// One of a member's documents no vault reaches, at the top: not linked from
+/// One of a member's documents no workspace reaches, at the top: not linked from
 /// another of their orphaned folders.
 #[derive(Clone, Debug)]
 pub struct Orphan {
@@ -54,7 +54,7 @@ pub struct Orphan {
 
 #[derive(Debug)]
 pub enum FileError {
-    /// The vault's root already has an entry with the folder's name.
+    /// The workspace's root already has an entry with the folder's name.
     FolderTaken,
     Internal(anyhow::Error),
 }
@@ -68,7 +68,9 @@ impl<E: Into<anyhow::Error>> From<E> for FileError {
 impl std::fmt::Display for FileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FileError::FolderTaken => write!(f, "the vault already has an entry with that name"),
+            FileError::FolderTaken => {
+                write!(f, "the workspace already has an entry with that name")
+            }
             FileError::Internal(e) => write!(f, "{e:#}"),
         }
     }
@@ -171,8 +173,8 @@ fn entry_name(orphan: &Orphan) -> Option<(String, &'static str)> {
 }
 
 impl Authz {
-    /// The member's documents no vault reaches, top-level only, oldest first.
-    /// `None` until every vault has been walked.
+    /// The member's documents no workspace reaches, top-level only, oldest first.
+    /// `None` until every workspace has been walked.
     pub async fn orphans_of(&self, did: &Did) -> Result<Option<Vec<Orphan>>> {
         let ids: Vec<DocumentId> = {
             let reach = self.0.reach.read().unwrap();
@@ -182,7 +184,7 @@ impl Authz {
             let creators = self.0.creators.read().unwrap();
             creators
                 .iter()
-                .filter(|(doc, creator)| creator.did == *did && reach.vault_of(doc).is_none())
+                .filter(|(doc, creator)| creator.did == *did && reach.workspace_of(doc).is_none())
                 .map(|(doc, _)| doc.clone())
                 .collect()
         };
@@ -252,7 +254,7 @@ impl Authz {
     }
 
     /// Put these orphans in a new folder at the root of the member's private
-    /// vault. Returns each linked document with the name it was given.
+    /// workspace. Returns each linked document with the name it was given.
     /// Orphans of no linkable kind are left where they are.
     pub async fn file_orphans(
         &self,
@@ -264,16 +266,16 @@ impl Authz {
         if folder.is_empty() {
             return Err(FileError::FolderTaken);
         }
-        let vault = self
-            .private_vault(did)
+        let workspace = self
+            .private_workspace(did)
             .await
-            .map_err(|e| anyhow::anyhow!("finding the private vault failed: {e:?}"))?;
-        let root = DocumentId::from_str(&vault.root_doc_id)
-            .map_err(|e| anyhow::anyhow!("unparseable vault root: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("finding the private workspace failed: {e:?}"))?;
+        let root = DocumentId::from_str(&workspace.root_doc_id)
+            .map_err(|e| anyhow::anyhow!("unparseable workspace root: {e:?}"))?;
         let root = self
             .open(&root)
             .await
-            .ok_or_else(|| anyhow::anyhow!("the vault's root folder did not load"))?;
+            .ok_or_else(|| anyhow::anyhow!("the workspace's root folder did not load"))?;
         let taken = root.with_document(|doc| {
             reach::read_entries(doc)
                 .iter()
@@ -332,7 +334,7 @@ impl Authz {
     /// and their creator rows. Returns how many documents went.
     ///
     /// Each one is checked again first: still the member's, and still in no
-    /// vault. One that fails either check stops the whole delete, and nothing
+    /// workspace. One that fails either check stops the whole delete, and nothing
     /// is removed. The caller stops the repo before this, so nothing it has
     /// loaded is written back afterwards.
     pub async fn delete_orphans(&self, did: &Did, orphans: &[Orphan]) -> Result<usize> {
@@ -346,8 +348,8 @@ impl Authz {
                     "{doc} is not the member's; nothing deleted"
                 );
                 anyhow::ensure!(
-                    reach.vault_of(doc).is_none(),
-                    "{doc} is in a vault; nothing deleted"
+                    reach.workspace_of(doc).is_none(),
+                    "{doc} is in a workspace; nothing deleted"
                 );
             }
         }
@@ -381,12 +383,12 @@ mod tests {
 
     use sqlx::PgPool;
 
-    use crate::authz::tests::{did, eventually, link, open, sent, unlink, vault};
+    use crate::authz::tests::{did, eventually, link, open, sent, unlink, workspace};
     use crate::mcp::notes::new_note;
     use crate::reach::new_folder;
 
     async fn walked(authz: &Authz) {
-        eventually("every vault is walked", || authz.all_walked()).await;
+        eventually("every workspace is walked", || authz.all_walked()).await;
     }
 
     async fn orphans(authz: &Authz, who: &Did) -> Vec<Orphan> {
@@ -406,10 +408,10 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_deleted_note_is_listed_and_filed_back_into_the_vault(pool: PgPool) {
+    async fn a_deleted_note_is_listed_and_filed_back_into_the_workspace(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice).await;
+        let (root, root_doc) = workspace(&authz, &repo, &alice).await;
         let note = sent(
             &authz,
             &repo,
@@ -419,10 +421,13 @@ mod tests {
         .await;
         let id = note.document_id().clone();
         link(&root_doc, "plan.md", "md", &id).await;
-        eventually("the note is in the vault", || authz.vault_of(&id).is_some()).await;
+        eventually("the note is in the workspace", || {
+            authz.workspace_of(&id).is_some()
+        })
+        .await;
         unlink(&root_doc, 0).await;
-        eventually("the note has left the vault", || {
-            authz.vault_of(&id).is_none()
+        eventually("the note has left the workspace", || {
+            authz.workspace_of(&id).is_none()
         })
         .await;
         walked(&authz).await;
@@ -438,8 +443,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(linked, vec![(id.clone(), "plan.md".to_string())]);
-        eventually("the note is back in the vault", || {
-            authz.vault_of(&id) == Some(root.clone())
+        eventually("the note is back in the workspace", || {
+            authz.workspace_of(&id) == Some(root.clone())
         })
         .await;
         assert!(orphans(&authz, &alice).await.is_empty());
@@ -449,19 +454,19 @@ mod tests {
     async fn a_deleted_folder_comes_back_whole(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice).await;
+        let (root, root_doc) = workspace(&authz, &repo, &alice).await;
         let folder = sent(&authz, &repo, &alice, new_folder("Art Projects").unwrap()).await;
         let note = sent(&authz, &repo, &alice, new_note("kiln.md", "glaze").unwrap()).await;
         let note_id = note.document_id().clone();
         link(&folder, "kiln.md", "md", &note_id).await;
         link(&root_doc, "Art Projects", "folder", folder.document_id()).await;
-        eventually("the note is in the vault", || {
-            authz.vault_of(&note_id).is_some()
+        eventually("the note is in the workspace", || {
+            authz.workspace_of(&note_id).is_some()
         })
         .await;
         unlink(&root_doc, 0).await;
-        eventually("the note has left the vault", || {
-            authz.vault_of(&note_id).is_none()
+        eventually("the note has left the workspace", || {
+            authz.workspace_of(&note_id).is_none()
         })
         .await;
         walked(&authz).await;
@@ -475,17 +480,17 @@ mod tests {
             .file_orphans(&alice, "Recovered", &found)
             .await
             .unwrap();
-        eventually("the folder's note is back in the vault", || {
-            authz.vault_of(&note_id) == Some(root.clone())
+        eventually("the folder's note is back in the workspace", || {
+            authz.workspace_of(&note_id) == Some(root.clone())
         })
         .await;
     }
 
     #[sqlx::test(migrations = false)]
-    async fn nothing_is_listed_before_every_vault_is_walked(pool: PgPool) {
+    async fn nothing_is_listed_before_every_workspace_is_walked(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, _) = vault(&authz, &repo, &alice).await;
+        let (root, _) = workspace(&authz, &repo, &alice).await;
         sent(&authz, &repo, &alice, new_note("loose.md", "").unwrap()).await;
         walked(&authz).await;
         authz.0.reach.write().unwrap().forget_walk(&root);
@@ -496,14 +501,14 @@ mod tests {
     async fn only_the_members_own_orphans_are_listed(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let (alice, bob) = (did("alice"), did("bob"));
-        let (_, root_doc) = vault(&authz, &repo, &alice).await;
+        let (_, root_doc) = workspace(&authz, &repo, &alice).await;
         let filed = sent(&authz, &repo, &alice, new_note("kept.md", "").unwrap()).await;
         let filed_id = filed.document_id().clone();
         link(&root_doc, "kept.md", "md", &filed_id).await;
         sent(&authz, &repo, &bob, new_note("bobs.md", "").unwrap()).await;
         sent(&authz, &repo, &alice, new_note("loose.md", "").unwrap()).await;
-        eventually("the kept note is in the vault", || {
-            authz.vault_of(&filed_id).is_some()
+        eventually("the kept note is in the workspace", || {
+            authz.workspace_of(&filed_id).is_some()
         })
         .await;
         walked(&authz).await;
@@ -515,7 +520,7 @@ mod tests {
     async fn two_orphans_with_one_name_get_the_plugins_conflict_name(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        vault(&authz, &repo, &alice).await;
+        workspace(&authz, &repo, &alice).await;
         sent(&authz, &repo, &alice, new_note("a.md", "one").unwrap()).await;
         sent(&authz, &repo, &alice, new_note("A.md", "two").unwrap()).await;
         walked(&authz).await;
@@ -544,13 +549,13 @@ mod tests {
     async fn nothing_is_written_when_the_folder_name_is_taken(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (_, root_doc) = vault(&authz, &repo, &alice).await;
+        let (_, root_doc) = workspace(&authz, &repo, &alice).await;
         sent(&authz, &repo, &alice, new_note("loose.md", "").unwrap()).await;
         let existing = sent(&authz, &repo, &alice, new_folder("Recovered").unwrap()).await;
         let existing = existing.document_id().clone();
         link(&root_doc, "recovered", "folder", &existing).await;
-        eventually("the existing folder is in the vault", || {
-            authz.vault_of(&existing).is_some()
+        eventually("the existing folder is in the workspace", || {
+            authz.workspace_of(&existing).is_some()
         })
         .await;
         walked(&authz).await;
@@ -565,7 +570,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn filing_makes_the_private_vault_if_there_is_none_yet(pool: PgPool) {
+    async fn filing_makes_the_private_workspace_if_there_is_none_yet(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
         let loose = sent(&authz, &repo, &alice, new_note("loose.md", "").unwrap()).await;
@@ -576,9 +581,10 @@ mod tests {
             .file_orphans(&alice, "Recovered", &found)
             .await
             .unwrap();
-        let private = authz.private_vault(&alice).await.unwrap();
-        eventually("the note is in the new vault", || {
-            authz.vault_of(&loose).map(|root| root.to_string()) == Some(private.root_doc_id.clone())
+        let private = authz.private_workspace(&alice).await.unwrap();
+        eventually("the note is in the new workspace", || {
+            authz.workspace_of(&loose).map(|root| root.to_string())
+                == Some(private.root_doc_id.clone())
         })
         .await;
     }
@@ -605,7 +611,7 @@ mod tests {
     async fn deleting_removes_the_orphans_and_what_they_hold_and_nothing_else(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let (alice, bob) = (did("alice"), did("bob"));
-        let (_, root_doc) = vault(&authz, &repo, &alice).await;
+        let (_, root_doc) = workspace(&authz, &repo, &alice).await;
         let kept = sent(&authz, &repo, &alice, new_note("kept.md", "").unwrap()).await;
         let kept = kept.document_id().clone();
         link(&root_doc, "kept.md", "md", &kept).await;
@@ -618,8 +624,8 @@ mod tests {
         let loose = loose.document_id().clone();
         let bobs = sent(&authz, &repo, &bob, new_note("bobs.md", "").unwrap()).await;
         let bobs = bobs.document_id().clone();
-        eventually("the kept note is in the vault", || {
-            authz.vault_of(&kept).is_some()
+        eventually("the kept note is in the workspace", || {
+            authz.workspace_of(&kept).is_some()
         })
         .await;
         walked(&authz).await;
@@ -640,18 +646,18 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_document_back_in_a_vault_stops_the_delete(pool: PgPool) {
+    async fn a_document_back_in_a_workspace_stops_the_delete(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (_, root_doc) = vault(&authz, &repo, &alice).await;
+        let (_, root_doc) = workspace(&authz, &repo, &alice).await;
         let loose = sent(&authz, &repo, &alice, new_note("loose.md", "").unwrap()).await;
         let loose = loose.document_id().clone();
         walked(&authz).await;
         let found = orphans(&authz, &alice).await;
 
         link(&root_doc, "loose.md", "md", &loose).await;
-        eventually("the note is in the vault", || {
-            authz.vault_of(&loose).is_some()
+        eventually("the note is in the workspace", || {
+            authz.workspace_of(&loose).is_some()
         })
         .await;
         assert!(authz.delete_orphans(&alice, &found).await.is_err());

@@ -37,35 +37,35 @@ impl fmt::Display for Did {
     }
 }
 
-/// Who is asking: a member, and the workspaces Corliss said they were in when
+/// Who is asking: a member, and the groups Corliss said they were in when
 /// it issued their token.
 ///
-/// The workspaces are as fresh as the token, so being removed from one takes
+/// The groups are as fresh as the token, so being removed from one takes
 /// effect when the token is next renewed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Caller {
     pub did: Did,
-    /// Workspace IDs, opaque: the token travels in a websocket URL, so it
-    /// names no workspace in words.
-    pub workspaces: Vec<String>,
+    /// Group IDs, opaque: the token travels in a websocket URL, so it
+    /// names no group in words.
+    pub groups: Vec<String>,
 }
 
 impl Caller {
-    pub fn is_in(&self, workspace: &str) -> bool {
-        self.workspaces.iter().any(|w| w == workspace)
+    pub fn is_in(&self, group: &str) -> bool {
+        self.groups.iter().any(|w| w == group)
     }
 
-    pub fn in_workspaces(did: Did, workspaces: Vec<String>) -> Self {
-        Self { did, workspaces }
+    pub fn in_groups(did: Did, groups: Vec<String>) -> Self {
+        Self { did, groups }
     }
 }
 
-/// A caller in no workspace.
+/// A caller in no group.
 impl From<Did> for Caller {
     fn from(did: Did) -> Self {
         Self {
             did,
-            workspaces: Vec::new(),
+            groups: Vec::new(),
         }
     }
 }
@@ -179,10 +179,11 @@ pub struct CorlissVerifier {
 struct Claims {
     sub: String,
     exp: u64,
-    /// The IDs of the workspaces the member was in at issue. Absent from a
-    /// token issued before Corliss sent it, which reads as no workspaces.
-    #[serde(default)]
-    workspaces: Vec<String>,
+    /// The IDs of the groups the member was in at issue. The claim is
+    /// `workspaces`, Corliss's word for its groups. Absent from a token issued
+    /// before Corliss sent it, which reads as no groups.
+    #[serde(default, rename = "workspaces")]
+    groups: Vec<String>,
 }
 
 impl CorlissVerifier {
@@ -318,14 +319,14 @@ impl CorlissVerifier {
         if !is_did(&claims.sub) {
             return Err(invalid("subject is not a DID"));
         }
-        if !claims.workspaces.iter().all(|w| is_workspace_id(w)) {
-            return Err(invalid("a workspace ID is malformed"));
+        if !claims.groups.iter().all(|w| is_group_id(w)) {
+            return Err(invalid("a group ID is malformed"));
         }
 
         Ok(Verified {
             caller: Caller {
                 did: Did(claims.sub),
-                workspaces: claims.workspaces,
+                groups: claims.groups,
             },
             expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(claims.exp)),
         })
@@ -341,14 +342,14 @@ pub fn is_did(s: &str) -> bool {
         && parts.next().is_some_and(|id| !id.is_empty())
 }
 
-/// The longest workspace ID, in bytes.
-const MAX_WORKSPACE_ID: usize = 64;
+/// The longest group ID, in bytes.
+const MAX_GROUP_ID: usize = 64;
 
-/// A workspace ID as Corliss writes one: short, and ASCII letters, digits, `-`
+/// A group ID as Corliss writes one: short, and ASCII letters, digits, `-`
 /// and `_` only. The relay never interprets it, only compares it.
-pub fn is_workspace_id(s: &str) -> bool {
+pub fn is_group_id(s: &str) -> bool {
     !s.is_empty()
-        && s.len() <= MAX_WORKSPACE_ID
+        && s.len() <= MAX_GROUP_ID
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
@@ -508,7 +509,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn workspaces_claim_is_read() {
+    async fn groups_claim_is_read() {
         let spec = TokenSpec::default().claim("workspaces", json!(["7", "garden-2"]));
         let caller = verify(spec).await.unwrap().caller;
         assert!(caller.is_in("7"));

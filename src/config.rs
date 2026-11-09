@@ -32,7 +32,7 @@ pub struct Config {
     /// on, so a gated relay cannot start half configured.
     pub auth: Option<AuthConfig>,
 
-    /// The credential Corliss presents on `/internal/vaults`. Required when
+    /// The credential Corliss presents on `/internal/workspaces`. Required when
     /// `require_auth` is on. Without it those endpoints refuse every call.
     pub service_token: Option<String>,
 

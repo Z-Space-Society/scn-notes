@@ -134,7 +134,7 @@ impl Filter {
     }
 
     /// Wait a moment for a document another member has just linked into a
-    /// workspace's vault.
+    /// group's workspace.
     ///
     /// Their folder change reaches this peer at once, and the peer asks for
     /// the new note straight away, before the index has walked the folder. A
@@ -143,10 +143,10 @@ impl Filter {
     /// would offer it later. So the request is held until the index admits the
     /// note or [`ADMISSION_WAIT`] passes.
     ///
-    /// Only a caller in a workspace, asking for someone else's document that
-    /// no vault reaches yet, ever waits. Everything else is answered at once.
+    /// Only a caller in a group, asking for someone else's document that
+    /// no workspace reaches yet, ever waits. Everything else is answered at once.
     async fn admitted_soon(&self, doc: &samod::DocumentId) -> bool {
-        if self.caller.workspaces.is_empty() || self.authz.holder_of(doc).is_some() {
+        if self.caller.groups.is_empty() || self.authz.holder_of(doc).is_some() {
             return false;
         }
         let deadline = tokio::time::Instant::now() + ADMISSION_WAIT;
@@ -286,7 +286,7 @@ mod tests {
     use sqlx::PgPool;
 
     use crate::auth::Did;
-    use crate::authz::tests::{did, link, member_of, open, sent_by, workspace_vault};
+    use crate::authz::tests::{did, group_workspace, link, member_of, open, sent_by};
     use crate::wire::tests::{doc_id, frame, CLIENT, RELAY};
 
     fn as_member(authz: &Authz, did: Did) -> Filter {
@@ -298,9 +298,9 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_request_for_a_note_just_linked_into_a_workspace_vault_waits_for_it(pool: PgPool) {
+    async fn a_request_for_a_note_just_linked_into_a_group_workspace_waits_for_it(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        let (_, root_doc) = workspace_vault(&authz, &repo, "7").await;
+        let (_, root_doc) = group_workspace(&authz, &repo, "7").await;
         let bob = Filter::new(authz.clone(), member_of("bob", &["7"]));
         let dave = Filter::new(authz.clone(), member_of("dave", &["8"]));
 
@@ -314,7 +314,7 @@ mod tests {
         );
         assert!(bob.outbound(&frame("sync", Some(&note))));
 
-        // Someone outside the workspace waits out the same moment and is
+        // Someone outside the group waits out the same moment and is
         // refused.
         assert_eq!(
             dave.inbound(&frame("request", Some(&note))).await,
@@ -355,8 +355,8 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn another_members_document_is_denied_and_withheld(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        let vault = authz.private_vault(&did("alice")).await.unwrap();
-        let root = vault.root_doc_id.parse().unwrap();
+        let workspace = authz.private_workspace(&did("alice")).await.unwrap();
+        let root = workspace.root_doc_id.parse().unwrap();
         let note = repo.create(Automerge::new()).await.unwrap();
         let note = note.document_id();
         authz.record(note, &did("alice")).await.unwrap();

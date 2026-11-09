@@ -3,20 +3,24 @@
 //! Every check goes through [`Authz::may_open`]: the sync filter in both
 //! directions and every MCP tool.
 //!
-//! A vault is held by one member or by one workspace. A member's own vault
-//! opens to them alone. A workspace's vault opens to whoever's token says they
-//! are in that workspace. Corliss decides that when it issues the token, so the
+//! A workspace is held by one member or by one group. A member's own workspace
+//! opens to them alone. A group's workspace opens to whoever's token says they
+//! are in that group. Corliss decides that when it issues the token, so the
 //! relay holds no roster.
+//!
+//! The words: a workspace is the notes, a member's Private one or a group's
+//! shared one. A group is the members who share one, which Corliss calls a
+//! workspace; its ID is `group_id` here and the `workspaces` claim in a token.
 //!
 //! Two records back it, in two tables beside `storage`:
 //!
-//! - `vaults`: one row per vault, naming its creator, the workspace that holds
+//! - `workspaces`: one row per workspace, naming its creator, the group that holds
 //!   it if any, and its root folder document.
 //! - `doc_creators`: the DID of whoever first sent each document, and the
-//!   workspaces their token named when they sent it.
+//!   groups their token named when they sent it.
 //!
 //! `doc_creators` is loaded into memory at startup and written through, and
-//! the set of documents reachable from each vault's root is derived from it and
+//! the set of documents reachable from each workspace's root is derived from it and
 //! held in memory too (`reach.rs`). So `may_open` never touches the database,
 //! which matters because it runs on every frame.
 
@@ -45,33 +49,33 @@ pub(crate) struct Inner {
     pub(crate) actors: RwLock<Actors>,
 }
 
-/// Who a vault belongs to.
+/// Who a workspace belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Holder {
     Member(Did),
-    Workspace(String),
+    Group(String),
 }
 
 impl Holder {
-    fn of(owner: Did, workspace: Option<String>) -> Self {
-        match workspace {
-            Some(workspace) => Holder::Workspace(workspace),
+    fn of(owner: Did, group: Option<String>) -> Self {
+        match group {
+            Some(group) => Holder::Group(group),
             None => Holder::Member(owner),
         }
     }
 
-    /// May this caller open the vault?
+    /// May this caller open the workspace?
     pub fn opens_to(&self, caller: &Caller) -> bool {
         match self {
             Holder::Member(owner) => *owner == caller.did,
-            Holder::Workspace(workspace) => caller.is_in(workspace),
+            Holder::Group(group) => caller.is_in(group),
         }
     }
 
-    /// The admission rule: may a document by this creator join the vault?
+    /// The admission rule: may a document by this creator join the workspace?
     ///
-    /// For a member's vault, only if they made it. For a workspace's, only if
-    /// its creator was in the workspace when they sent it, so a note outlives
+    /// For a member's workspace, only if they made it. For a group's, only if
+    /// its creator was in the group when they sent it, so a note outlives
     /// its author's membership. Either way, a member cannot pull someone
     /// else's document in by writing its URL into a folder.
     pub fn admits(&self, creator: &Caller) -> bool {
@@ -83,65 +87,67 @@ impl std::fmt::Display for Holder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Holder::Member(did) => write!(f, "{did}"),
-            Holder::Workspace(workspace) => write!(f, "workspace {workspace}"),
+            Holder::Group(group) => write!(f, "group {group}"),
         }
     }
 }
 
-/// A member's private vault's path: the group alone, since a member has one.
+/// A member's Private workspace's path: the root folder alone, since a member
+/// has one.
 pub const PRIVATE: &str = "Private";
-/// The group workspaces' vaults are listed under.
+/// The root folder shared workspaces are listed under.
 pub const WORKSPACES: &str = "Workspaces";
 
-/// A vault's path: `Private` for a member's one private vault, which has no
-/// name, and the name under its group for a workspace's, `Workspaces/Garden
+/// A workspace's path: `Private` for a member's one private workspace, which has no
+/// name, and the name under `Workspaces` for a shared one, `Workspaces/Garden
 /// Club`.
 ///
 /// The one place these words are spelled. Every listing carries the result as
 /// `path`, so MCP, the Obsidian plugin's folders and Corliss's pages all show
 /// what this says rather than each building it.
-pub fn path_of(name: Option<&str>, workspace: Option<&str>) -> String {
-    match workspace {
+pub fn path_of(name: Option<&str>, group: Option<&str>) -> String {
+    match group {
         Some(_) => format!("{WORKSPACES}/{}", name.unwrap_or_default()),
         None => PRIVATE.to_string(),
     }
 }
 
-/// A vault as the endpoints return it.
+/// A workspace as the endpoints return it.
 #[derive(Clone, Debug, Serialize)]
-pub struct Vault {
+pub struct Workspace {
     pub root_doc_id: String,
     pub url: String,
-    /// The workspace's name for its vault. Null for a member's private vault,
+    /// The group's name for its workspace. Null for a member's private workspace,
     /// which has none of its own.
     pub name: Option<String>,
-    /// The workspace that holds the vault, or null for a member's own.
-    pub workspace: Option<String>,
-    /// The name with its group, from [`path_of`]: how MCP names the vault and
+    /// The group that shares the workspace, or null for a member's Private
+    /// workspace. Corliss's workspace ID today.
+    pub group_id: Option<String>,
+    /// The name with its group, from [`path_of`]: how MCP names the workspace and
     /// where the Obsidian plugin puts it.
     pub path: String,
     pub created_at: DateTime<Utc>,
     pub last_change_at: Option<DateTime<Utc>>,
-    /// Null until the relay has walked the vault since it started.
+    /// Null until the relay has walked the workspace since it started.
     pub note_count: Option<usize>,
-    /// Bytes the vault's documents take in storage: Automerge history, not
+    /// Bytes the workspace's documents take in storage: Automerge history, not
     /// the size of the notes as files. Filled by [`Authz::add_sizes`] only,
-    /// so the MCP tools, which list vaults on every call, never pay for it.
+    /// so the MCP tools, which list workspaces on every call, never pay for it.
     pub bytes: Option<i64>,
 }
 
-/// A vault with the DID that made it, for the admin listing only.
+/// A workspace with the DID that made it, for the admin listing only.
 ///
-/// A wrapper rather than a field on [`Vault`], so the member-facing listings
-/// never start telling a workspace's members which of them made its vault.
+/// A wrapper rather than a field on [`Workspace`], so the member-facing listings
+/// never start telling a group's members which of them made its workspace.
 #[derive(Clone, Debug, Serialize)]
-pub struct HeldVault {
+pub struct HeldWorkspace {
     pub owner_did: String,
     #[serde(flatten)]
-    pub vault: Vault,
+    pub workspace: Workspace,
 }
 
-/// One creator's documents that no vault reaches.
+/// One creator's documents that no workspace reaches.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Unfiled {
     pub did: String,
@@ -149,26 +155,26 @@ pub struct Unfiled {
     pub bytes: i64,
 }
 
-/// A `vaults` row as a [`Vault`], with what the index knows filled in.
-fn vault_from(row: &sqlx::postgres::PgRow, reach: &reach::Index) -> Result<Vault> {
+/// A `workspaces` row as a [`Workspace`], with what the index knows filled in.
+fn workspace_from(row: &sqlx::postgres::PgRow, reach: &reach::Index) -> Result<Workspace> {
     let root: String = row.try_get("root_doc_id")?;
     let id = DocumentId::from_str(&root).ok();
     // Memory is ahead of the table by up to a minute.
     let in_memory = id.as_ref().and_then(|id| reach.last_change(id));
-    let workspace: Option<String> = row.try_get("workspace_id")?;
+    let group: Option<String> = row.try_get("group_id")?;
     // A private row written before v0.5.0 may still carry its old name until
     // the startup statements clear it; it is never shown.
-    let name: Option<String> = match workspace {
+    let name: Option<String> = match group {
         Some(_) => row.try_get("name")?,
         None => None,
     };
-    Ok(Vault {
+    Ok(Workspace {
         url: format!("automerge:{root}"),
         note_count: id.as_ref().and_then(|id| reach.note_count(id)),
         root_doc_id: root,
-        path: path_of(name.as_deref(), workspace.as_deref()),
+        path: path_of(name.as_deref(), group.as_deref()),
         name,
-        workspace,
+        group_id: group,
         created_at: row.try_get("created_at")?,
         last_change_at: in_memory.or(row.try_get("last_change_at")?),
         bytes: None,
@@ -176,26 +182,26 @@ fn vault_from(row: &sqlx::postgres::PgRow, reach: &reach::Index) -> Result<Vault
 }
 
 #[derive(Debug)]
-pub enum CreateVaultError {
-    /// A workspace's vault name that is empty or too long once trimmed.
+pub enum CreateWorkspaceError {
+    /// A group's workspace name that is empty or too long once trimmed.
     InvalidName,
     Internal(anyhow::Error),
 }
 
-impl<E: Into<anyhow::Error>> From<E> for CreateVaultError {
+impl<E: Into<anyhow::Error>> From<E> for CreateWorkspaceError {
     fn from(e: E) -> Self {
-        CreateVaultError::Internal(e.into())
+        CreateWorkspaceError::Internal(e.into())
     }
 }
 
-/// The longest vault name, in characters, after trimming.
-const MAX_VAULT_NAME: usize = 100;
+/// The longest workspace name, in characters, after trimming.
+const MAX_WORKSPACE_NAME: usize = 100;
 
 impl Authz {
     /// Create the tables if needed, load the records, and start indexing.
     ///
-    /// The reachability index fills in behind this call, one vault at a time.
-    /// That is safe to serve through: until a vault is indexed its documents
+    /// The reachability index fills in behind this call, one workspace at a time.
+    /// That is safe to serve through: until a workspace is indexed its documents
     /// are still open to their creator, who is its owner, and to nobody else.
     pub async fn load(pool: PgPool, repo: Repo) -> Result<Self> {
         migrate(&pool)
@@ -203,7 +209,7 @@ impl Authz {
             .context("could not create the ownership schema")?;
 
         let mut creators = HashMap::new();
-        for row in sqlx::query("SELECT doc_id, creator_did, workspaces FROM doc_creators")
+        for row in sqlx::query("SELECT doc_id, creator_did, groups FROM doc_creators")
             .fetch_all(&pool)
             .await?
         {
@@ -212,10 +218,7 @@ impl Authz {
                 Ok(id) => {
                     creators.insert(
                         id,
-                        Caller::in_workspaces(
-                            Did(row.try_get("creator_did")?),
-                            row.try_get("workspaces")?,
-                        ),
+                        Caller::in_groups(Did(row.try_get("creator_did")?), row.try_get("groups")?),
                     );
                 }
                 Err(_) => tracing::warn!(%doc_id, "skipping an unparseable document ID"),
@@ -233,18 +236,18 @@ impl Authz {
         }));
 
         for row in
-            sqlx::query("SELECT root_doc_id, owner_did, workspace_id, last_change_at FROM vaults")
+            sqlx::query("SELECT root_doc_id, owner_did, group_id, last_change_at FROM workspaces")
                 .fetch_all(&authz.0.pool)
                 .await?
         {
             let root: String = row.try_get("root_doc_id")?;
             match DocumentId::from_str(&root) {
-                Ok(id) => authz.start_vault(
+                Ok(id) => authz.start_workspace(
                     id,
-                    Holder::of(Did(row.try_get("owner_did")?), row.try_get("workspace_id")?),
+                    Holder::of(Did(row.try_get("owner_did")?), row.try_get("group_id")?),
                     row.try_get("last_change_at")?,
                 ),
-                Err(_) => tracing::warn!(%root, "skipping a vault with an unparseable root"),
+                Err(_) => tracing::warn!(%root, "skipping a workspace with an unparseable root"),
             }
         }
         authz.start_last_change_flush();
@@ -254,8 +257,8 @@ impl Authz {
 
     /// May this caller open this document?
     ///
-    /// Yes when the document is reachable from a vault that opens to them, or
-    /// when they created it and no vault reaches it. The second case is a note
+    /// Yes when the document is reachable from a workspace that opens to them, or
+    /// when they created it and no workspace reaches it. The second case is a note
     /// not yet linked into a folder, one part way through a move, or one whose
     /// entry was deleted.
     pub fn may_open(&self, caller: &Caller, doc: &DocumentId) -> bool {
@@ -274,7 +277,7 @@ impl Authz {
         self.0.creators.read().unwrap().get(doc).cloned()
     }
 
-    /// Who holds the vault a document is in, if the index has it in one.
+    /// Who holds the workspace a document is in, if the index has it in one.
     pub(crate) fn holder_of(&self, doc: &DocumentId) -> Option<Holder> {
         self.0.reach.read().unwrap().holder_of(doc).cloned()
     }
@@ -282,8 +285,8 @@ impl Authz {
     /// Record who first sent a document, and return who that turned out to be.
     ///
     /// The first writer wins and the row is never changed, so two peers racing
-    /// on one ID cannot both become its creator. Their workspaces are kept as
-    /// the token named them then, which is what lets a workspace's vault keep
+    /// on one ID cannot both become its creator. Their groups are kept as
+    /// the token named them then, which is what lets a group's workspace keep
     /// a note after its author leaves. Only a document's first frame reaches
     /// the database; after that the answer comes from memory.
     pub async fn record_creator(&self, doc: &DocumentId, caller: &Caller) -> Result<Did> {
@@ -293,20 +296,19 @@ impl Authz {
 
         let doc_id = doc.to_string();
         sqlx::query(
-            "INSERT INTO doc_creators (doc_id, creator_did, workspaces) VALUES ($1, $2, $3)
+            "INSERT INTO doc_creators (doc_id, creator_did, groups) VALUES ($1, $2, $3)
              ON CONFLICT (doc_id) DO NOTHING",
         )
         .bind(&doc_id)
         .bind(&caller.did.0)
-        .bind(&caller.workspaces)
+        .bind(&caller.groups)
         .execute(&self.0.pool)
         .await?;
-        let row = sqlx::query("SELECT creator_did, workspaces FROM doc_creators WHERE doc_id = $1")
+        let row = sqlx::query("SELECT creator_did, groups FROM doc_creators WHERE doc_id = $1")
             .bind(&doc_id)
             .fetch_one(&self.0.pool)
             .await?;
-        let creator =
-            Caller::in_workspaces(Did(row.try_get("creator_did")?), row.try_get("workspaces")?);
+        let creator = Caller::in_groups(Did(row.try_get("creator_did")?), row.try_get("groups")?);
         let did = creator.did.clone();
 
         self.0
@@ -320,51 +322,54 @@ impl Authz {
         Ok(did)
     }
 
-    /// The vaults open to a caller, oldest first: their own, then their
-    /// workspaces', interleaved by age.
-    pub async fn list_vaults(&self, caller: &Caller) -> Result<Vec<Vault>> {
-        self.vaults_where(&caller.did, &caller.workspaces).await
+    /// The workspaces open to a caller, oldest first: their own, then their
+    /// groups', interleaved by age.
+    pub async fn list_workspaces(&self, caller: &Caller) -> Result<Vec<Workspace>> {
+        self.workspaces_where(&caller.did, &caller.groups).await
     }
 
-    /// The vaults a member holds plus those of the named workspaces. Corliss
-    /// names the workspaces itself; a sync or MCP caller's come from their
-    /// token, through [`Authz::list_vaults`].
+    /// The workspaces a member holds plus those of the named groups. Corliss
+    /// names the groups itself; a sync or MCP caller's come from their
+    /// token, through [`Authz::list_workspaces`].
     ///
-    /// The member's private vault is made here when they have none yet, so
+    /// The member's private workspace is made here when they have none yet, so
     /// whoever asks first, the Obsidian plugin, MCP or Corliss, finds it.
-    pub async fn vaults_where(&self, owner: &Did, workspaces: &[String]) -> Result<Vec<Vault>> {
-        let mut vaults = self.listed(owner, workspaces).await?;
-        if !vaults.iter().any(|vault| vault.workspace.is_none()) {
-            self.private_vault(owner)
+    pub async fn workspaces_where(&self, owner: &Did, groups: &[String]) -> Result<Vec<Workspace>> {
+        let mut workspaces = self.listed(owner, groups).await?;
+        if !workspaces
+            .iter()
+            .any(|workspace| workspace.group_id.is_none())
+        {
+            self.private_workspace(owner)
                 .await
-                .map_err(|e| anyhow::anyhow!("making the private vault failed: {e:?}"))?;
-            vaults = self.listed(owner, workspaces).await?;
+                .map_err(|e| anyhow::anyhow!("making the private workspace failed: {e:?}"))?;
+            workspaces = self.listed(owner, groups).await?;
         }
-        Ok(vaults)
+        Ok(workspaces)
     }
 
-    async fn listed(&self, owner: &Did, workspaces: &[String]) -> Result<Vec<Vault>> {
+    async fn listed(&self, owner: &Did, groups: &[String]) -> Result<Vec<Workspace>> {
         let rows = sqlx::query(
-            "SELECT root_doc_id, name, workspace_id, created_at, last_change_at FROM vaults
-             WHERE (owner_did = $1 AND workspace_id IS NULL) OR workspace_id = ANY($2)
+            "SELECT root_doc_id, name, group_id, created_at, last_change_at FROM workspaces
+             WHERE (owner_did = $1 AND group_id IS NULL) OR group_id = ANY($2)
              ORDER BY created_at, root_doc_id",
         )
         .bind(&owner.0)
-        .bind(workspaces)
+        .bind(groups)
         .fetch_all(&self.0.pool)
         .await?;
 
         let reach = self.0.reach.read().unwrap();
-        rows.iter().map(|row| vault_from(row, &reach)).collect()
+        rows.iter().map(|row| workspace_from(row, &reach)).collect()
     }
 
-    /// Every vault on the relay, with the DID that made it, for Corliss's
+    /// Every workspace on the relay, with the DID that made it, for Corliss's
     /// admin view. Takes no argument on purpose: there is nothing for a
     /// request to choose.
-    pub async fn all_vaults(&self) -> Result<Vec<HeldVault>> {
+    pub async fn all_workspaces(&self) -> Result<Vec<HeldWorkspace>> {
         let rows = sqlx::query(
-            "SELECT root_doc_id, owner_did, name, workspace_id, created_at, last_change_at
-             FROM vaults ORDER BY created_at, root_doc_id",
+            "SELECT root_doc_id, owner_did, name, group_id, created_at, last_change_at
+             FROM workspaces ORDER BY created_at, root_doc_id",
         )
         .fetch_all(&self.0.pool)
         .await?;
@@ -372,17 +377,17 @@ impl Authz {
         let reach = self.0.reach.read().unwrap();
         rows.iter()
             .map(|row| {
-                Ok(HeldVault {
+                Ok(HeldWorkspace {
                     owner_did: row.try_get("owner_did")?,
-                    vault: vault_from(row, &reach)?,
+                    workspace: workspace_from(row, &reach)?,
                 })
             })
             .collect()
     }
 
-    /// Per creator, the documents they sent that no vault reaches, and the
-    /// bytes those take. `None` until every vault has been walked, because an
-    /// unwalked vault's documents would be counted here.
+    /// Per creator, the documents they sent that no workspace reaches, and the
+    /// bytes those take. `None` until every workspace has been walked, because an
+    /// unwalked workspace's documents would be counted here.
     ///
     /// These are notes linked from no folder: deleted entries, a move cut off
     /// part way, a first frame whose folder never arrived, and entries of a
@@ -396,7 +401,7 @@ impl Authz {
             let creators = self.0.creators.read().unwrap();
             let mut by_creator: HashMap<String, Vec<String>> = HashMap::new();
             for (doc, creator) in creators.iter() {
-                if reach.vault_of(doc).is_none() {
+                if reach.workspace_of(doc).is_none() {
                     by_creator
                         .entry(creator.did.0.clone())
                         .or_default()
@@ -418,15 +423,18 @@ impl Authz {
         Ok(Some(unfiled))
     }
 
-    /// Fill in `bytes` for vaults that have been walked.
-    pub async fn add_sizes(&self, vaults: impl IntoIterator<Item = &mut Vault>) -> Result<()> {
-        for vault in vaults {
-            let docs = DocumentId::from_str(&vault.root_doc_id)
+    /// Fill in `bytes` for workspaces that have been walked.
+    pub async fn add_sizes(
+        &self,
+        workspaces: impl IntoIterator<Item = &mut Workspace>,
+    ) -> Result<()> {
+        for workspace in workspaces {
+            let docs = DocumentId::from_str(&workspace.root_doc_id)
                 .ok()
                 .and_then(|root| self.0.reach.read().unwrap().docs_of(&root));
             let Some(docs) = docs else { continue };
             let docs: Vec<String> = docs.iter().map(ToString::to_string).collect();
-            vault.bytes = Some(self.bytes_of(&docs).await?);
+            workspace.bytes = Some(self.bytes_of(&docs).await?);
         }
         Ok(())
     }
@@ -447,60 +455,60 @@ impl Authz {
         .await?)
     }
 
-    /// The member's private vault, made now if they have none. A member has
+    /// The member's private workspace, made now if they have none. A member has
     /// one.
     ///
     /// Membership is not checked. The caller is Corliss acting for a signed-in
-    /// member, or the member's own token, and a vault whose owner cannot get a
+    /// member, or the member's own token, and a workspace whose owner cannot get a
     /// token is unreachable anyway.
-    pub async fn private_vault(&self, owner: &Did) -> Result<Vault, CreateVaultError> {
+    pub async fn private_workspace(&self, owner: &Did) -> Result<Workspace, CreateWorkspaceError> {
         self.find_or_create(owner, None).await
     }
 
-    /// The workspace's vault, made now by `creator` if it has none, and
-    /// carrying `name`, the workspace's name in Corliss, either way. A
-    /// workspace has one vault.
+    /// The group's workspace, made now by `creator` if it has none, and
+    /// carrying `name`, the group's name in Corliss, either way. A
+    /// group has one workspace.
     ///
-    /// Membership of the workspace is not checked either: Corliss holds the
+    /// Membership of the group is not checked either: Corliss holds the
     /// roster and asks only for a member of it. Only the listing's name
     /// changes on a rename. The root folder's own `title` is left alone: no
     /// client reads it, and rewriting it would be an edit every member syncs.
-    pub async fn workspace_vault(
+    pub async fn group_workspace(
         &self,
         creator: &Did,
-        workspace: &str,
+        group: &str,
         name: &str,
-    ) -> Result<Vault, CreateVaultError> {
+    ) -> Result<Workspace, CreateWorkspaceError> {
         let name = name.trim();
-        if name.is_empty() || name.chars().count() > MAX_VAULT_NAME {
-            return Err(CreateVaultError::InvalidName);
+        if name.is_empty() || name.chars().count() > MAX_WORKSPACE_NAME {
+            return Err(CreateWorkspaceError::InvalidName);
         }
         sqlx::query(
-            "UPDATE vaults SET name = $1 WHERE workspace_id = $2 AND name IS DISTINCT FROM $1",
+            "UPDATE workspaces SET name = $1 WHERE group_id = $2 AND name IS DISTINCT FROM $1",
         )
         .bind(name)
-        .bind(workspace)
+        .bind(group)
         .execute(&self.0.pool)
         .await?;
-        self.find_or_create(creator, Some((workspace, name))).await
+        self.find_or_create(creator, Some((group, name))).await
     }
 
-    /// The vault's row as a [`Vault`], if there is one.
-    async fn find(&self, owner: &Did, workspace: Option<&str>) -> Result<Option<Vault>> {
-        let row = match workspace {
-            Some(workspace) => {
+    /// The workspace's row as a [`Workspace`], if there is one.
+    async fn find(&self, owner: &Did, group: Option<&str>) -> Result<Option<Workspace>> {
+        let row = match group {
+            Some(group) => {
                 sqlx::query(
-                    "SELECT root_doc_id, name, workspace_id, created_at, last_change_at
-                     FROM vaults WHERE workspace_id = $1",
+                    "SELECT root_doc_id, name, group_id, created_at, last_change_at
+                     FROM workspaces WHERE group_id = $1",
                 )
-                .bind(workspace)
+                .bind(group)
                 .fetch_optional(&self.0.pool)
                 .await?
             }
             None => {
                 sqlx::query(
-                    "SELECT root_doc_id, name, workspace_id, created_at, last_change_at
-                     FROM vaults WHERE owner_did = $1 AND workspace_id IS NULL",
+                    "SELECT root_doc_id, name, group_id, created_at, last_change_at
+                     FROM workspaces WHERE owner_did = $1 AND group_id IS NULL",
                 )
                 .bind(&owner.0)
                 .fetch_optional(&self.0.pool)
@@ -508,23 +516,23 @@ impl Authz {
             }
         };
         let reach = self.0.reach.read().unwrap();
-        row.map(|row| vault_from(&row, &reach)).transpose()
+        row.map(|row| workspace_from(&row, &reach)).transpose()
     }
 
-    /// Find the vault, or make it: an empty root folder document and its row.
+    /// Find the workspace, or make it: an empty root folder document and its row.
     async fn find_or_create(
         &self,
         owner: &Did,
-        workspace: Option<(&str, &str)>,
-    ) -> Result<Vault, CreateVaultError> {
-        let id = workspace.map(|(id, _)| id);
+        group: Option<(&str, &str)>,
+    ) -> Result<Workspace, CreateWorkspaceError> {
+        let id = group.map(|(id, _)| id);
         // Asked first so the ordinary case leaves no document behind. The
         // unique indexes below are what make it true under a race.
-        if let Some(vault) = self.find(owner, id).await? {
-            return Ok(vault);
+        if let Some(workspace) = self.find(owner, id).await? {
+            return Ok(workspace);
         }
 
-        let title = workspace.map_or(PRIVATE, |(_, name)| name);
+        let title = group.map_or(PRIVATE, |(_, name)| name);
         let handle = self
             .0
             .repo
@@ -532,79 +540,70 @@ impl Authz {
             .await
             .map_err(|_| anyhow::anyhow!("repo stopped"))?;
         let root = handle.document_id().clone();
-        // The root is the vault's own from the start, whatever this row says,
+        // The root is the workspace's own from the start, whatever this row says,
         // so the creator recorded here only matters if the insert below fails.
         let creator =
-            Caller::in_workspaces(owner.clone(), id.map(str::to_string).into_iter().collect());
+            Caller::in_groups(owner.clone(), id.map(str::to_string).into_iter().collect());
         self.record_creator(&root, &creator).await?;
 
         let inserted = sqlx::query(
-            "INSERT INTO vaults (root_doc_id, owner_did, workspace_id, name)
+            "INSERT INTO workspaces (root_doc_id, owner_did, group_id, name)
              VALUES ($1, $2, $3, $4)",
         )
         .bind(root.to_string())
         .bind(&owner.0)
         .bind(id)
-        .bind(workspace.map(|(_, name)| name))
+        .bind(group.map(|(_, name)| name))
         .execute(&self.0.pool)
         .await;
         match inserted {
-            Ok(_) => self.start_vault(
+            Ok(_) => self.start_workspace(
                 root,
                 Holder::of(owner.clone(), id.map(str::to_string)),
                 None,
             ),
-            // Lost a race to another request making the same vault. The root
+            // Lost a race to another request making the same workspace. The root
             // document stays behind, open only to its creator and linked from
-            // nowhere, and the winner's vault is the answer.
+            // nowhere, and the winner's workspace is the answer.
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {}
             Err(e) => return Err(e.into()),
         }
-        self.find(owner, id)
-            .await?
-            .ok_or_else(|| CreateVaultError::Internal(anyhow::anyhow!("the vault's row is gone")))
+        self.find(owner, id).await?.ok_or_else(|| {
+            CreateWorkspaceError::Internal(anyhow::anyhow!("the workspace's row is gone"))
+        })
     }
 }
 
 /// Same approach as `PostgresStorage::migrate`: idempotent statements at
 /// startup, no migration framework.
+///
+/// v0.7.0 renamed vaults to workspaces. A database from before it has a
+/// `vaults` table: the statements that brought older relays up to v0.6.0 run
+/// on it first, then one transaction renames it. A fresh database takes the
+/// same path, so there is one way in and it is the one the tests run.
 async fn migrate(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let renamed: bool = sqlx::query_scalar("SELECT to_regclass('workspaces') IS NOT NULL")
+        .fetch_one(pool)
+        .await?;
+    if !renamed {
+        for &statement in BEFORE_V0_7_0 {
+            sqlx::query(statement).execute(pool).await?;
+        }
+        let mut tx = pool.begin().await?;
+        for &statement in RENAME_V0_7_0 {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+    }
     for statement in [
-        "CREATE TABLE IF NOT EXISTS vaults (
-             root_doc_id    TEXT PRIMARY KEY,
-             owner_did      TEXT NOT NULL,
-             name           TEXT NOT NULL,
-             created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-             last_change_at TIMESTAMPTZ
-         )",
-        // Null for a member's own vault.
-        "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS workspace_id TEXT",
-        // Up to v0.3.0 this index covered every row, and up to v0.4.4 the one
-        // after it allowed a member many private vaults, one per name.
-        "DROP INDEX IF EXISTS vaults_owner_name",
-        "DROP INDEX IF EXISTS vaults_member_name",
-        // From v0.5.0 a member's private vault has no name: its path is
-        // `Private`. A workspace's vault keeps the workspace's name.
-        "ALTER TABLE vaults ALTER COLUMN name DROP NOT NULL",
-        "UPDATE vaults SET name = NULL WHERE workspace_id IS NULL AND name IS NOT NULL",
-        // One private vault per member. Fails, and so stops startup, if a
+        // One Private workspace per member. Fails, and so stops startup, if a
         // member has two: merging them is not something to do silently. Also
         // serves the lookup by owner.
-        "CREATE UNIQUE INDEX IF NOT EXISTS vaults_member
-             ON vaults (owner_did) WHERE workspace_id IS NULL",
-        // One vault per workspace. Also serves the lookup by workspace.
-        "CREATE UNIQUE INDEX IF NOT EXISTS vaults_workspace
-             ON vaults (workspace_id) WHERE workspace_id IS NOT NULL",
-        "CREATE TABLE IF NOT EXISTS doc_creators (
-             doc_id      TEXT PRIMARY KEY,
-             creator_did TEXT NOT NULL,
-             created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-         )",
-        // The creator's workspaces when they sent the document. Empty for
-        // every row written before v0.4.0, which is right: no workspace vault
-        // existed then.
-        "ALTER TABLE doc_creators
-             ADD COLUMN IF NOT EXISTS workspaces TEXT[] NOT NULL DEFAULT '{}'",
+        "CREATE UNIQUE INDEX IF NOT EXISTS workspaces_private
+             ON workspaces (owner_did) WHERE group_id IS NULL",
+        // One workspace per group. Also serves the lookup by group.
+        "CREATE UNIQUE INDEX IF NOT EXISTS workspaces_group
+             ON workspaces (group_id) WHERE group_id IS NOT NULL",
         // Who each Automerge actor belongs to; see `actors.rs`.
         "CREATE TABLE IF NOT EXISTS actor_members (
              actor_id      TEXT PRIMARY KEY,
@@ -625,6 +624,53 @@ async fn migrate(pool: &PgPool) -> Result<(), sqlx::Error> {
     }
     Ok(())
 }
+
+/// The schema as v0.6.0 left it, under its old names. Kept as written so a
+/// database from any earlier relay arrives at the same place.
+const BEFORE_V0_7_0: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS vaults (
+         root_doc_id    TEXT PRIMARY KEY,
+         owner_did      TEXT NOT NULL,
+         name           TEXT NOT NULL,
+         created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+         last_change_at TIMESTAMPTZ
+     )",
+    // Null for a member's own vault.
+    "ALTER TABLE vaults ADD COLUMN IF NOT EXISTS workspace_id TEXT",
+    // Up to v0.3.0 this index covered every row, and up to v0.4.4 the one
+    // after it allowed a member many private vaults, one per name.
+    "DROP INDEX IF EXISTS vaults_owner_name",
+    "DROP INDEX IF EXISTS vaults_member_name",
+    // From v0.5.0 a member's private vault has no name: its path is
+    // `Private`. A workspace's vault keeps the workspace's name.
+    "ALTER TABLE vaults ALTER COLUMN name DROP NOT NULL",
+    "UPDATE vaults SET name = NULL WHERE workspace_id IS NULL AND name IS NOT NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS vaults_member
+         ON vaults (owner_did) WHERE workspace_id IS NULL",
+    "CREATE UNIQUE INDEX IF NOT EXISTS vaults_workspace
+         ON vaults (workspace_id) WHERE workspace_id IS NOT NULL",
+    "CREATE TABLE IF NOT EXISTS doc_creators (
+         doc_id      TEXT PRIMARY KEY,
+         creator_did TEXT NOT NULL,
+         created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+     )",
+    // The creator's workspaces when they sent the document. Empty for every
+    // row written before v0.4.0, which is right: no workspace vault existed
+    // then.
+    "ALTER TABLE doc_creators
+         ADD COLUMN IF NOT EXISTS workspaces TEXT[] NOT NULL DEFAULT '{}'",
+];
+
+/// v0.7.0's vocabulary: a vault is a workspace, and what Corliss calls a
+/// workspace is the group that shares one. Run in one transaction.
+const RENAME_V0_7_0: &[&str] = &[
+    "ALTER TABLE vaults RENAME TO workspaces",
+    "ALTER TABLE workspaces RENAME COLUMN workspace_id TO group_id",
+    "ALTER INDEX IF EXISTS vaults_pkey RENAME TO workspaces_pkey",
+    "ALTER INDEX IF EXISTS vaults_member RENAME TO workspaces_private",
+    "ALTER INDEX IF EXISTS vaults_workspace RENAME TO workspaces_group",
+    "ALTER TABLE doc_creators RENAME COLUMN workspaces TO groups",
+];
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -669,27 +715,27 @@ pub(crate) mod tests {
     }
 
     impl Authz {
-        pub fn vault_of(&self, doc: &DocumentId) -> Option<DocumentId> {
-            self.0.reach.read().unwrap().vault_of(doc).cloned()
+        pub fn workspace_of(&self, doc: &DocumentId) -> Option<DocumentId> {
+            self.0.reach.read().unwrap().workspace_of(doc).cloned()
         }
 
         pub fn all_walked(&self) -> bool {
             self.0.reach.read().unwrap().all_walked()
         }
 
-        /// [`Authz::may_open`] for a member in no workspace.
+        /// [`Authz::may_open`] for a member in no group.
         pub fn opens(&self, did: &Did, doc: &DocumentId) -> bool {
             self.may_open(&did.clone().into(), doc)
         }
 
-        /// [`Authz::record_creator`] for a member in no workspace.
+        /// [`Authz::record_creator`] for a member in no group.
         pub async fn record(&self, doc: &DocumentId, did: &Did) -> Result<Did> {
             self.record_creator(doc, &did.clone().into()).await
         }
 
-        /// [`Authz::list_vaults`] for a member in no workspace.
-        pub async fn vaults_of(&self, did: &Did) -> Result<Vec<Vault>> {
-            self.list_vaults(&did.clone().into()).await
+        /// [`Authz::list_workspaces`] for a member in no group.
+        pub async fn workspaces_of(&self, did: &Did) -> Result<Vec<Workspace>> {
+            self.list_workspaces(&did.clone().into()).await
         }
     }
 
@@ -726,22 +772,22 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    /// The member's private vault: its root and a handle on it.
-    pub async fn vault(authz: &Authz, repo: &Repo, owner: &Did) -> (DocumentId, DocHandle) {
-        let vault = authz.private_vault(owner).await.unwrap();
-        let root = DocumentId::from_str(&vault.root_doc_id).unwrap();
+    /// The member's private workspace: its root and a handle on it.
+    pub async fn workspace(authz: &Authz, repo: &Repo, owner: &Did) -> (DocumentId, DocHandle) {
+        let workspace = authz.private_workspace(owner).await.unwrap();
+        let root = DocumentId::from_str(&workspace.root_doc_id).unwrap();
         let handle = repo.find(root.clone()).await.unwrap().unwrap();
         (root, handle)
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_vault_root_is_open_to_its_owner_only(pool: PgPool) {
+    async fn a_workspace_root_is_open_to_its_owner_only(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        let (root, _) = vault(&authz, &repo, &did("alice")).await;
+        let (root, _) = workspace(&authz, &repo, &did("alice")).await;
 
         assert!(authz.opens(&did("alice"), &root));
         assert!(!authz.opens(&did("bob"), &root));
-        assert_eq!(authz.vault_of(&root), Some(root));
+        assert_eq!(authz.workspace_of(&root), Some(root));
     }
 
     #[sqlx::test(migrations = false)]
@@ -752,7 +798,7 @@ pub(crate) mod tests {
 
         assert!(authz.opens(&did("alice"), note));
         assert!(!authz.opens(&did("bob"), note));
-        assert_eq!(authz.vault_of(note), None);
+        assert_eq!(authz.workspace_of(note), None);
     }
 
     #[sqlx::test(migrations = false)]
@@ -773,10 +819,10 @@ pub(crate) mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn linked_notes_and_nested_folders_join_the_vault(pool: PgPool) {
+    async fn linked_notes_and_nested_folders_join_the_workspace(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice).await;
+        let (root, root_doc) = workspace(&authz, &repo, &alice).await;
 
         let folder = sent(&authz, &repo, &alice, new_folder("Projects").unwrap()).await;
         let note = sent(&authz, &repo, &alice, Automerge::new()).await;
@@ -784,11 +830,11 @@ pub(crate) mod tests {
         link(&root_doc, "Projects", "folder", folder.document_id()).await;
 
         let note = note.document_id().clone();
-        eventually("the nested note is in the vault", || {
-            authz.vault_of(&note) == Some(root.clone())
+        eventually("the nested note is in the workspace", || {
+            authz.workspace_of(&note) == Some(root.clone())
         })
         .await;
-        assert_eq!(authz.vault_of(folder.document_id()), Some(root));
+        assert_eq!(authz.workspace_of(folder.document_id()), Some(root));
         assert!(authz.opens(&alice, &note));
         assert!(!authz.opens(&did("bob"), &note));
     }
@@ -797,7 +843,7 @@ pub(crate) mod tests {
     async fn a_link_to_someone_elses_document_is_ignored(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let (alice, bob) = (did("alice"), did("bob"));
-        let (root, root_doc) = vault(&authz, &repo, &alice).await;
+        let (root, root_doc) = workspace(&authz, &repo, &alice).await;
 
         let theirs = sent(&authz, &repo, &bob, Automerge::new()).await;
         let mine = sent(&authz, &repo, &alice, Automerge::new()).await;
@@ -806,11 +852,11 @@ pub(crate) mod tests {
 
         // The second link shows the walk that saw the first has finished.
         let mine = mine.document_id().clone();
-        eventually("alice's own note is in the vault", || {
-            authz.vault_of(&mine) == Some(root.clone())
+        eventually("alice's own note is in the workspace", || {
+            authz.workspace_of(&mine) == Some(root.clone())
         })
         .await;
-        assert_eq!(authz.vault_of(theirs.document_id()), None);
+        assert_eq!(authz.workspace_of(theirs.document_id()), None);
         assert!(!authz.opens(&alice, theirs.document_id()));
         assert!(authz.opens(&bob, theirs.document_id()));
     }
@@ -819,7 +865,7 @@ pub(crate) mod tests {
     async fn a_link_that_arrives_before_the_note_waits_for_its_creator(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice).await;
+        let (root, root_doc) = workspace(&authz, &repo, &alice).await;
 
         // Stored, but nobody is recorded as having sent it yet.
         let note = repo.create(Automerge::new()).await.unwrap();
@@ -830,15 +876,15 @@ pub(crate) mod tests {
         link(&root_doc, "marker.md", "md", marker.document_id()).await;
         let marker = marker.document_id().clone();
         eventually("the walk has seen both links", || {
-            authz.vault_of(&marker) == Some(root.clone())
+            authz.workspace_of(&marker) == Some(root.clone())
         })
         .await;
-        assert_eq!(authz.vault_of(&note_id), None);
+        assert_eq!(authz.workspace_of(&note_id), None);
         assert!(!authz.opens(&alice, &note_id));
 
         authz.record(&note_id, &alice).await.unwrap();
         eventually("the waiting link is admitted", || {
-            authz.vault_of(&note_id) == Some(root.clone())
+            authz.workspace_of(&note_id) == Some(root.clone())
         })
         .await;
     }
@@ -847,15 +893,15 @@ pub(crate) mod tests {
     async fn a_note_survives_a_move_and_outlives_its_last_entry(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice).await;
+        let (root, root_doc) = workspace(&authz, &repo, &alice).await;
 
         let folder = sent(&authz, &repo, &alice, new_folder("Archive").unwrap()).await;
         let note = sent(&authz, &repo, &alice, Automerge::new()).await;
         let note_id = note.document_id().clone();
         link(&root_doc, "Archive", "folder", folder.document_id()).await;
         link(&root_doc, "a.md", "md", &note_id).await;
-        eventually("the note is in the vault", || {
-            authz.vault_of(&note_id) == Some(root.clone())
+        eventually("the note is in the workspace", || {
+            authz.workspace_of(&note_id) == Some(root.clone())
         })
         .await;
 
@@ -863,12 +909,12 @@ pub(crate) mod tests {
         link(&folder, "a.md", "md", &note_id).await;
         unlink(&root_doc, 1).await;
         tokio::time::sleep(Duration::from_millis(2500)).await;
-        assert_eq!(authz.vault_of(&note_id), Some(root));
+        assert_eq!(authz.workspace_of(&note_id), Some(root));
 
-        // Deleted: out of the vault, still its creator's.
+        // Deleted: out of the workspace, still its creator's.
         unlink(&folder, 0).await;
-        eventually("the note has left the vault", || {
-            authz.vault_of(&note_id).is_none()
+        eventually("the note has left the workspace", || {
+            authz.workspace_of(&note_id).is_none()
         })
         .await;
         assert!(authz.opens(&alice, &note_id));
@@ -879,7 +925,7 @@ pub(crate) mod tests {
     async fn entries_of_other_types_are_left_alone(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice).await;
+        let (root, root_doc) = workspace(&authz, &repo, &alice).await;
 
         let canvas = sent(&authz, &repo, &alice, Automerge::new()).await;
         let note = sent(&authz, &repo, &alice, Automerge::new()).await;
@@ -887,19 +933,19 @@ pub(crate) mod tests {
         link(&root_doc, "a.md", "md", note.document_id()).await;
 
         let note = note.document_id().clone();
-        eventually("the note is in the vault", || {
-            authz.vault_of(&note) == Some(root.clone())
+        eventually("the note is in the workspace", || {
+            authz.workspace_of(&note) == Some(root.clone())
         })
         .await;
-        assert_eq!(authz.vault_of(canvas.document_id()), None);
+        assert_eq!(authz.workspace_of(canvas.document_id()), None);
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_change_in_the_vault_sets_its_last_change(pool: PgPool) {
+    async fn a_change_in_the_workspace_sets_its_last_change(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (_, root_doc) = vault(&authz, &repo, &alice).await;
-        assert!(authz.vaults_of(&alice).await.unwrap()[0]
+        let (_, root_doc) = workspace(&authz, &repo, &alice).await;
+        assert!(authz.workspaces_of(&alice).await.unwrap()[0]
             .last_change_at
             .is_none());
 
@@ -907,7 +953,7 @@ pub(crate) mod tests {
         link(&root_doc, "a.md", "md", note.document_id()).await;
 
         for _ in 0..100 {
-            if authz.vaults_of(&alice).await.unwrap()[0]
+            if authz.workspaces_of(&alice).await.unwrap()[0]
                 .last_change_at
                 .is_some()
             {
@@ -919,10 +965,10 @@ pub(crate) mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_walked_vault_has_a_note_count_and_a_size(pool: PgPool) {
+    async fn a_walked_workspace_has_a_note_count_and_a_size(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let alice = did("alice");
-        let (root, root_doc) = vault(&authz, &repo, &alice).await;
+        let (root, root_doc) = workspace(&authz, &repo, &alice).await;
 
         let mut notes = Vec::new();
         for name in ["a.md", "b.md"] {
@@ -930,18 +976,18 @@ pub(crate) mod tests {
             link(&root_doc, name, "md", note.document_id()).await;
             notes.push(note.document_id().clone());
         }
-        // Alice's own, but linked from nowhere: in no vault's total.
+        // Alice's own, but linked from nowhere: in no workspace's total.
         sent(&authz, &repo, &alice, Automerge::new()).await;
-        eventually("both notes are in the vault", || {
+        eventually("both notes are in the workspace", || {
             notes
                 .iter()
-                .all(|note| authz.vault_of(note) == Some(root.clone()))
+                .all(|note| authz.workspace_of(note) == Some(root.clone()))
         })
         .await;
 
-        let mut vaults = authz.vaults_of(&alice).await.unwrap();
-        assert_eq!(vaults[0].note_count, Some(2));
-        assert_eq!(vaults[0].bytes, None, "only add_sizes fills it");
+        let mut workspaces = authz.workspaces_of(&alice).await.unwrap();
+        assert_eq!(workspaces[0].note_count, Some(2));
+        assert_eq!(workspaces[0].bytes, None, "only add_sizes fills it");
 
         let mut expected = 0;
         for doc in [&root].into_iter().chain(&notes) {
@@ -956,23 +1002,23 @@ pub(crate) mod tests {
             assert!(doc_bytes > 0, "{doc} has nothing in storage");
             expected += doc_bytes;
         }
-        authz.add_sizes(&mut vaults).await.unwrap();
-        assert_eq!(vaults[0].bytes, Some(expected));
+        authz.add_sizes(&mut workspaces).await.unwrap();
+        assert_eq!(workspaces[0].bytes, Some(expected));
     }
 
     #[sqlx::test(migrations = false)]
-    async fn documents_no_vault_reaches_are_counted_per_creator(pool: PgPool) {
+    async fn documents_no_workspace_reaches_are_counted_per_creator(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
         let (alice, bob) = (did("alice"), did("bob"));
-        let (root, root_doc) = vault(&authz, &repo, &alice).await;
+        let (root, root_doc) = workspace(&authz, &repo, &alice).await;
 
         let filed = sent(&authz, &repo, &alice, Automerge::new()).await;
         link(&root_doc, "a.md", "md", filed.document_id()).await;
         let stray = sent(&authz, &repo, &alice, Automerge::new()).await;
         let bobs = sent(&authz, &repo, &bob, Automerge::new()).await;
         let filed = filed.document_id().clone();
-        eventually("the filed note is in the vault", || {
-            authz.vault_of(&filed) == Some(root.clone())
+        eventually("the filed note is in the workspace", || {
+            authz.workspace_of(&filed) == Some(root.clone())
         })
         .await;
 
@@ -994,86 +1040,118 @@ pub(crate) mod tests {
         }
         assert_eq!(authz.unfiled().await.unwrap(), Some(expected));
 
-        let all = authz.all_vaults().await.unwrap();
+        let all = authz.all_workspaces().await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].owner_did, alice.0);
-        assert_eq!(all[0].vault.note_count, Some(1));
+        assert_eq!(all[0].workspace.note_count, Some(1));
     }
 
     #[sqlx::test(migrations = false)]
-    async fn unfiled_is_unknown_until_every_vault_is_walked(pool: PgPool) {
+    async fn unfiled_is_unknown_until_every_workspace_is_walked(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        let (root, _) = vault(&authz, &repo, &did("alice")).await;
+        let (root, _) = workspace(&authz, &repo, &did("alice")).await;
         // Let the first walk finish so it cannot land after the line below.
-        eventually("the vault is walked", || authz.all_walked()).await;
+        eventually("the workspace is walked", || authz.all_walked()).await;
         assert!(authz.unfiled().await.unwrap().is_some());
-        // Stand in for the moment after startup when a vault is registered
+        // Stand in for the moment after startup when a workspace is registered
         // and its walk has not finished.
         authz.0.reach.write().unwrap().forget_walk(&root);
         assert_eq!(authz.unfiled().await.unwrap(), None);
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_member_has_one_private_vault_with_no_name_made_when_first_listed(pool: PgPool) {
+    async fn a_member_has_one_private_workspace_with_no_name_made_when_first_listed(pool: PgPool) {
         let (authz, _repo) = open(&pool).await;
         let alice = did("alice");
 
-        let listed = authz.vaults_of(&alice).await.unwrap();
+        let listed = authz.workspaces_of(&alice).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, None);
-        assert_eq!(listed[0].workspace, None);
+        assert_eq!(listed[0].group_id, None);
         assert_eq!(listed[0].path, "Private");
 
-        // Asked again, every way, it is the same vault.
+        // Asked again, every way, it is the same workspace.
         assert_eq!(
-            authz.vaults_of(&alice).await.unwrap()[0].root_doc_id,
+            authz.workspaces_of(&alice).await.unwrap()[0].root_doc_id,
             listed[0].root_doc_id
         );
         assert_eq!(
-            authz.private_vault(&alice).await.unwrap().root_doc_id,
+            authz.private_workspace(&alice).await.unwrap().root_doc_id,
             listed[0].root_doc_id
         );
-        let bobs = authz.private_vault(&did("bob")).await.unwrap();
+        let bobs = authz.private_workspace(&did("bob")).await.unwrap();
         assert_ne!(bobs.root_doc_id, listed[0].root_doc_id);
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_named_private_vault_from_before_v0_5_0_keeps_its_root_and_loses_its_name(
-        pool: PgPool,
-    ) {
+    async fn a_database_from_before_v0_7_0_is_renamed_and_keeps_everything(pool: PgPool) {
         let (authz, _repo) = open(&pool).await;
         let alice = did("alice");
-        let before = authz.private_vault(&alice).await.unwrap();
-        // As v0.4 left it: the private vault carries the name it was made with.
-        sqlx::query("UPDATE vaults SET name = 'SCN Notes' WHERE workspace_id IS NULL")
-            .execute(&pool)
-            .await
-            .unwrap();
+        let private = authz.private_workspace(&alice).await.unwrap();
+        let shared = authz.group_workspace(&alice, "7", "Garden").await.unwrap();
+        let note = sent(&authz, &_repo, &alice, Automerge::new()).await;
         drop(authz);
 
+        // Back to the names v0.6.0 left, with the private row still carrying
+        // the name v0.4 gave it.
+        for statement in [
+            "ALTER TABLE workspaces RENAME TO vaults",
+            "ALTER TABLE vaults RENAME COLUMN group_id TO workspace_id",
+            "ALTER INDEX workspaces_pkey RENAME TO vaults_pkey",
+            "ALTER INDEX workspaces_private RENAME TO vaults_member",
+            "ALTER INDEX workspaces_group RENAME TO vaults_workspace",
+            "ALTER TABLE doc_creators RENAME COLUMN groups TO workspaces",
+            "UPDATE doc_creators SET workspaces = '{7}'",
+            "UPDATE vaults SET name = 'SCN Notes' WHERE workspace_id IS NULL",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+
         let (authz, _repo) = open(&pool).await;
-        let after = authz.vaults_of(&alice).await.unwrap();
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].root_doc_id, before.root_doc_id);
-        assert_eq!(after[0].path, "Private");
-        assert_eq!(after[0].name, None);
-        let stored: Option<String> =
-            sqlx::query_scalar("SELECT name FROM vaults WHERE workspace_id IS NULL")
+        let after = authz.workspaces_where(&alice, &["7".into()]).await.unwrap();
+        let roots: Vec<_> = after.iter().map(|w| w.root_doc_id.clone()).collect();
+        assert!(roots.contains(&private.root_doc_id) && roots.contains(&shared.root_doc_id));
+        let mine = after.iter().find(|w| w.group_id.is_none()).unwrap();
+        assert_eq!(
+            (mine.path.as_str(), mine.name.as_deref()),
+            ("Private", None)
+        );
+
+        let (group, name): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT group_id, name FROM workspaces WHERE root_doc_id = $1")
+                .bind(&shared.root_doc_id)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(stored, None);
-    }
+        assert_eq!(
+            (group.as_deref(), name.as_deref()),
+            (Some("7"), Some("Garden"))
+        );
+        assert_eq!(authz.creator(note.document_id()).unwrap().groups, ["7"]);
 
-    /// A member whose token names these workspaces.
-    pub fn member_of(name: &str, workspaces: &[&str]) -> Caller {
-        Caller::in_workspaces(
-            did(name),
-            workspaces.iter().map(|w| w.to_string()).collect(),
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'workspaces' ORDER BY 1",
         )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            indexes,
+            ["workspaces_group", "workspaces_pkey", "workspaces_private"]
+        );
+        let old: bool = sqlx::query_scalar("SELECT to_regclass('vaults') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!old);
     }
 
-    /// A document as a sync client in some workspaces would have sent it.
+    /// A member whose token names these groups.
+    pub fn member_of(name: &str, groups: &[&str]) -> Caller {
+        Caller::in_groups(did(name), groups.iter().map(|w| w.to_string()).collect())
+    }
+
+    /// A document as a sync client in some groups would have sent it.
     pub async fn sent_by(authz: &Authz, repo: &Repo, creator: &Caller) -> DocumentId {
         let handle = repo.create(Automerge::new()).await.unwrap();
         authz
@@ -1083,46 +1161,46 @@ pub(crate) mod tests {
         handle.document_id().clone()
     }
 
-    pub async fn workspace_vault(
+    pub async fn group_workspace(
         authz: &Authz,
         repo: &Repo,
-        workspace: &str,
+        group: &str,
     ) -> (DocumentId, DocHandle) {
-        let vault = authz
-            .workspace_vault(&did("alice"), workspace, "Garden")
+        let workspace = authz
+            .group_workspace(&did("alice"), group, "Garden")
             .await
             .unwrap();
-        assert_eq!(vault.workspace.as_deref(), Some(workspace));
-        let root = DocumentId::from_str(&vault.root_doc_id).unwrap();
+        assert_eq!(workspace.group_id.as_deref(), Some(group));
+        let root = DocumentId::from_str(&workspace.root_doc_id).unwrap();
         let handle = repo.find(root.clone()).await.unwrap().unwrap();
         (root, handle)
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_workspace_vault_opens_to_whoever_the_token_puts_in_it(pool: PgPool) {
+    async fn a_group_workspace_opens_to_whoever_the_token_puts_in_it(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        let (root, _) = workspace_vault(&authz, &repo, "7").await;
+        let (root, _) = group_workspace(&authz, &repo, "7").await;
 
         assert!(authz.may_open(&member_of("bob", &["7"]), &root));
         assert!(authz.may_open(&member_of("carol", &["3", "7"]), &root));
-        // Alice made it, but a token without the workspace does not open it.
+        // Alice made it, but a token without the group does not open it.
         assert!(!authz.may_open(&member_of("alice", &[]), &root));
         assert!(!authz.may_open(&member_of("dave", &["8"]), &root));
     }
 
     #[sqlx::test(migrations = false)]
-    async fn members_notes_join_a_workspace_vault_and_stay_after_they_leave(pool: PgPool) {
+    async fn members_notes_join_a_group_workspace_and_stay_after_they_leave(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        let (root, root_doc) = workspace_vault(&authz, &repo, "7").await;
+        let (root, root_doc) = group_workspace(&authz, &repo, "7").await;
 
         let bobs = sent_by(&authz, &repo, &member_of("bob", &["7"])).await;
         let carols = sent_by(&authz, &repo, &member_of("carol", &["7"])).await;
         link(&root_doc, "bob.md", "md", &bobs).await;
         link(&root_doc, "carol.md", "md", &carols).await;
-        eventually("both notes are in the vault", || {
+        eventually("both notes are in the workspace", || {
             [&bobs, &carols]
                 .iter()
-                .all(|note| authz.vault_of(note) == Some(root.clone()))
+                .all(|note| authz.workspace_of(note) == Some(root.clone()))
         })
         .await;
 
@@ -1130,18 +1208,18 @@ pub(crate) mod tests {
         assert!(authz.may_open(&member_of("carol", &["7"]), &bobs));
         assert!(authz.may_open(&member_of("bob", &["7"]), &carols));
 
-        // Bob's next token leaves the workspace out. He loses the vault, his
+        // Bob's next token leaves the group out. He loses the workspace, his
         // own note included, and the note stays for everyone still in it.
         assert!(!authz.may_open(&member_of("bob", &[]), &bobs));
         assert!(!authz.may_open(&member_of("bob", &[]), &root));
         assert!(authz.may_open(&member_of("carol", &["7"]), &bobs));
-        assert_eq!(authz.vault_of(&bobs), Some(root));
+        assert_eq!(authz.workspace_of(&bobs), Some(root));
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_workspace_vault_ignores_documents_from_outside_the_workspace(pool: PgPool) {
+    async fn a_group_workspace_ignores_documents_from_outside_the_group(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        let (root, root_doc) = workspace_vault(&authz, &repo, "7").await;
+        let (root, root_doc) = group_workspace(&authz, &repo, "7").await;
 
         // Dave was never in it. Bob's private note predates his joining.
         let daves = sent_by(&authz, &repo, &member_of("dave", &["8"])).await;
@@ -1151,41 +1229,41 @@ pub(crate) mod tests {
         link(&root_doc, "private.md", "md", &bobs_private).await;
         link(&root_doc, "shared.md", "md", &bobs_shared).await;
 
-        eventually("the admitted note is in the vault", || {
-            authz.vault_of(&bobs_shared) == Some(root.clone())
+        eventually("the admitted note is in the workspace", || {
+            authz.workspace_of(&bobs_shared) == Some(root.clone())
         })
         .await;
-        assert_eq!(authz.vault_of(&daves), None);
-        assert_eq!(authz.vault_of(&bobs_private), None);
+        assert_eq!(authz.workspace_of(&daves), None);
+        assert_eq!(authz.workspace_of(&bobs_private), None);
         assert!(!authz.may_open(&member_of("carol", &["7"]), &daves));
         assert!(!authz.may_open(&member_of("carol", &["7"]), &bobs_private));
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_workspace_has_one_vault_apart_from_its_members_own(pool: PgPool) {
+    async fn a_workspace_has_one_workspace_apart_from_its_members_own(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        let (root, _) = workspace_vault(&authz, &repo, "7").await;
+        let (root, _) = group_workspace(&authz, &repo, "7").await;
 
-        // Asked for again, by anyone, it is the same vault under the name
+        // Asked for again, by anyone, it is the same workspace under the name
         // Corliss sends: that is how a rename reaches it.
         let again = authz
-            .workspace_vault(&did("bob"), "7", " Garden Club ")
+            .group_workspace(&did("bob"), "7", " Garden Club ")
             .await
             .unwrap();
         assert_eq!(again.root_doc_id, root.to_string());
         assert_eq!(again.path, "Workspaces/Garden Club");
 
         for bad in ["", "   ", &"x".repeat(101)] {
-            let result = authz.workspace_vault(&did("bob"), "7", bad).await;
-            assert!(matches!(result, Err(CreateVaultError::InvalidName)));
+            let result = authz.group_workspace(&did("bob"), "7", bad).await;
+            assert!(matches!(result, Err(CreateWorkspaceError::InvalidName)));
         }
 
         let listed: Vec<_> = authz
-            .list_vaults(&member_of("alice", &["7"]))
+            .list_workspaces(&member_of("alice", &["7"]))
             .await
             .unwrap()
             .into_iter()
-            .map(|vault| (vault.path, vault.workspace))
+            .map(|workspace| (workspace.path, workspace.group_id))
             .collect();
         assert_eq!(
             listed,
@@ -1197,14 +1275,14 @@ pub(crate) mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_restart_keeps_workspace_vaults_and_creators(pool: PgPool) {
+    async fn a_restart_keeps_group_workspaces_and_creators(pool: PgPool) {
         let note = {
             let (authz, repo) = open(&pool).await;
-            let (root, root_doc) = workspace_vault(&authz, &repo, "7").await;
+            let (root, root_doc) = group_workspace(&authz, &repo, "7").await;
             let note = sent_by(&authz, &repo, &member_of("bob", &["7"])).await;
             link(&root_doc, "bob.md", "md", &note).await;
-            eventually("the note is in the vault", || {
-                authz.vault_of(&note) == Some(root.clone())
+            eventually("the note is in the workspace", || {
+                authz.workspace_of(&note) == Some(root.clone())
             })
             .await;
             repo.stop().await;
@@ -1213,7 +1291,7 @@ pub(crate) mod tests {
 
         let (authz, _repo) = open(&pool).await;
         eventually("the index is rebuilt from storage", || {
-            authz.vault_of(&note).is_some()
+            authz.workspace_of(&note).is_some()
         })
         .await;
         assert!(authz.may_open(&member_of("carol", &["7"]), &note));
@@ -1225,12 +1303,12 @@ pub(crate) mod tests {
         let alice = did("alice");
         let (root, note_id) = {
             let (authz, repo) = open(&pool).await;
-            let (root, root_doc) = vault(&authz, &repo, &alice).await;
+            let (root, root_doc) = workspace(&authz, &repo, &alice).await;
             let note = sent(&authz, &repo, &alice, Automerge::new()).await;
             let note_id = note.document_id().clone();
             link(&root_doc, "a.md", "md", &note_id).await;
-            eventually("the note is in the vault", || {
-                authz.vault_of(&note_id) == Some(root.clone())
+            eventually("the note is in the workspace", || {
+                authz.workspace_of(&note_id) == Some(root.clone())
             })
             .await;
             repo.stop().await;
@@ -1238,13 +1316,13 @@ pub(crate) mod tests {
         };
 
         let (authz, _repo) = open(&pool).await;
-        let vaults = authz.vaults_of(&alice).await.unwrap();
-        assert_eq!(vaults.len(), 1);
-        assert_eq!(vaults[0].root_doc_id, root.to_string());
+        let workspaces = authz.workspaces_of(&alice).await.unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].root_doc_id, root.to_string());
         assert!(authz.opens(&alice, &root));
         assert!(!authz.opens(&did("bob"), &note_id));
         eventually("the index is rebuilt from storage", || {
-            authz.vault_of(&note_id) == Some(root.clone())
+            authz.workspace_of(&note_id) == Some(root.clone())
         })
         .await;
     }

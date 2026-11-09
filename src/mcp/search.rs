@@ -1,6 +1,6 @@
-//! Text search across one vault.
+//! Text search across one workspace.
 //!
-//! Each search walks the vault's folders and reads its notes from the
+//! Each search walks the workspace's folders and reads its notes from the
 //! documents the relay already holds in memory. Nothing is kept between
 //! searches, so there is no index to fall out of step: a note that was deleted
 //! is not found, and a note that moved is found at its new path.
@@ -65,7 +65,7 @@ fn score(path: &str, text: &str, terms: &[String]) -> Option<Hit> {
     })
 }
 
-/// The notes in a vault that contain every word of the query, best first.
+/// The notes in a workspace that contain every word of the query, best first.
 pub async fn search(
     notes: &Notes<'_>,
     root: &DocumentId,
@@ -83,7 +83,7 @@ pub async fn search(
             continue;
         }
         // A note that will not load or has no text is skipped, not fatal:
-        // one bad document should not hide the rest of the vault.
+        // one bad document should not hide the rest of the workspace.
         let Some(handle) = notes.authz.open(&found.id).await else {
             continue;
         };

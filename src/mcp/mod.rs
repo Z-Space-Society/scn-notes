@@ -147,14 +147,14 @@ pub(crate) mod tests {
     use crate::auth::{Caller, Did};
     use crate::authz::Authz;
 
-    /// Every note in a member's only vault, as path and document ID.
+    /// Every note in a member's only workspace, as path and document ID.
     pub async fn notes_of(authz: &Authz, did: &Did) -> Vec<(String, DocumentId)> {
         let caller = Caller::from(did.clone());
         let notes = super::notes::Notes {
             authz,
             caller: &caller,
         };
-        let (root, _) = notes.vault(None).await.unwrap();
+        let (root, _) = notes.workspace(None).await.unwrap();
         notes
             .list(&root, "", true)
             .await

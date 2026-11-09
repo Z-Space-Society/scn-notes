@@ -13,8 +13,8 @@ mod mcp;
 mod reach;
 mod storage;
 mod unfiled;
-mod vaults;
 mod wire;
+mod workspaces;
 
 use std::future::IntoFuture;
 use std::sync::Arc;
@@ -52,7 +52,7 @@ struct AppState {
     /// Whether connections go through the filter. Off only with no verifier,
     /// where there is no DID to decide by.
     enforce: bool,
-    /// What Corliss presents on `/internal/vaults`. `None` refuses every call.
+    /// What Corliss presents on `/internal/workspaces`. `None` refuses every call.
     service_token: Option<Arc<str>>,
 }
 
@@ -180,12 +180,12 @@ async fn open_relay(config: &Config) -> Result<(Repo, Authz)> {
     Ok((repo, authz))
 }
 
-/// How long `file-unfiled` waits for the index to walk every vault.
+/// How long `file-unfiled` waits for the index to walk every workspace.
 const WALK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// `file-unfiled <did> [--folder <name>] [--apply | --delete]`: list a
-/// member's documents that no vault reaches. `--apply` links them into a new
-/// folder at the root of their private vault; `--delete` removes them from
+/// member's documents that no workspace reaches. `--apply` links them into a new
+/// folder at the root of their private workspace; `--delete` removes them from
 /// storage. Stops the repo before returning.
 async fn file_unfiled(repo: &Repo, authz: &Authz, args: &[String]) -> Result<()> {
     let result = run_file_unfiled(authz, args).await;
@@ -233,12 +233,12 @@ async fn run_file_unfiled(
         }
         anyhow::ensure!(
             started.elapsed() < WALK_TIMEOUT,
-            "the index did not walk every vault in {WALK_TIMEOUT:?}"
+            "the index did not walk every workspace in {WALK_TIMEOUT:?}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     };
 
-    println!("{} outside every vault for {}:", orphans.len(), did.0);
+    println!("{} outside every workspace for {}:", orphans.len(), did.0);
     for orphan in &orphans {
         let kind = match orphan.kind {
             unfiled::Kind::Folder => format!("folder, {} inside", orphan.inside),
@@ -262,14 +262,14 @@ async fn run_file_unfiled(
     if !apply {
         println!(
             "Nothing changed. Run again with --apply to put these in {folder:?} in the \
-             private vault, or with --delete to remove them."
+             private workspace, or with --delete to remove them."
         );
         return Ok(None);
     }
     match authz.file_orphans(&did, &folder, &orphans).await {
         Ok(linked) => {
             println!(
-                "Put {} in {folder:?} at the root of the private vault:",
+                "Put {} in {folder:?} at the root of the private workspace:",
                 linked.len()
             );
             for (id, name) in linked {
@@ -292,11 +292,18 @@ fn router(state: AppState) -> Router {
         .route("/", get(sync))
         .route("/sync", get(sync))
         .route("/health", get(health))
-        .route("/vaults", get(vaults::list_own))
+        .route("/vaults", get(workspaces::list_own_vaults))
         .route("/.well-known/oauth-protected-resource", get(sync_metadata))
-        .route("/internal/vaults", get(vaults::list_for_member))
-        .route("/internal/vaults/workspace", put(vaults::workspace))
-        .route("/internal/vaults/all", get(vaults::list_all))
+        // The shape before v0.7.0, for the Corliss before the rename. Goes when
+        // `sync.` retires.
+        .route("/internal/vaults", get(workspaces::vaults_for_member))
+        .route("/internal/vaults/workspace", put(workspaces::put_vault))
+        .route("/internal/vaults/all", get(workspaces::all_vaults))
+        .route(
+            "/internal/workspaces",
+            get(workspaces::workspaces_for_member).put(workspaces::put_workspace),
+        )
+        .route("/internal/workspaces/all", get(workspaces::all_workspaces))
         .with_state(state)
 }
 
@@ -329,7 +336,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 /// URL finds Corliss from here, so a member pastes one address, not two.
 ///
 /// The token goes in the query string on the websocket, where a browser or
-/// phone cannot set a header, and in the header on `/vaults`.
+/// phone cannot set a header, and in the header on `/workspaces`.
 async fn sync_metadata(State(state): State<AppState>) -> Response {
     match &state.oidc_issuer {
         Some(issuer) => Json(serde_json::json!({
@@ -502,52 +509,49 @@ mod tests {
         TokenSpec::default().claim("sub", json!(did)).sign()
     }
 
-    /// The member's private vault, as Corliss's listing makes and finds it.
-    async fn private_vault(base: &str, did: &str) -> (StatusCode, Value) {
+    /// The member's private workspace, as Corliss's listing makes and finds it.
+    async fn private_workspace(base: &str, did: &str) -> (StatusCode, Value) {
         let response = reqwest::Client::new()
-            .get(format!("{base}/internal/vaults?did={did}"))
+            .get(format!("{base}/internal/workspaces?did={did}"))
             .bearer_auth(SERVICE_TOKEN)
             .send()
             .await
             .unwrap();
         let status = response.status();
         let body: Value = response.json().await.unwrap();
-        let private = body["vaults"]
+        let private = body["workspaces"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|vault| vault["workspace"].is_null())
+            .find(|workspace| workspace["group_id"].is_null())
             .cloned()
             .unwrap();
         (status, private)
     }
 
-    /// The workspace's vault, as Corliss asks for it.
-    async fn workspace_vault(
-        base: &str,
-        did: &str,
-        workspace: &str,
-        name: &str,
-    ) -> reqwest::Response {
+    /// The group's workspace, as Corliss asks for it.
+    async fn group_workspace(base: &str, did: &str, group: &str, name: &str) -> reqwest::Response {
         reqwest::Client::new()
-            .put(format!("{base}/internal/vaults/workspace"))
+            .put(format!("{base}/internal/workspaces"))
             .bearer_auth(SERVICE_TOKEN)
-            .json(&json!({ "did": did, "workspace": workspace, "name": name }))
+            .json(&json!({ "did": did, "group_id": group, "name": name }))
             .send()
             .await
             .unwrap()
     }
 
-    /// The paths of the vaults a listing returns.
-    async fn vault_paths(request: reqwest::RequestBuilder) -> Vec<String> {
+    /// The paths of the workspaces a listing returns.
+    async fn workspace_paths(request: reqwest::RequestBuilder) -> Vec<String> {
         let response = request.send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value = response.json().await.unwrap();
-        body["vaults"]
+        // The member listing still answers in the shape before v0.7.0.
+        body.get("workspaces")
+            .unwrap_or(&body["vaults"])
             .as_array()
             .unwrap()
             .iter()
-            .map(|vault| vault["path"].as_str().unwrap().to_string())
+            .map(|workspace| workspace["path"].as_str().unwrap().to_string())
             .collect()
     }
 
@@ -581,21 +585,21 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_listing_makes_the_private_vault_only_its_owner_can_open(pool: PgPool) {
+    async fn a_listing_makes_the_private_workspace_only_its_owner_can_open(pool: PgPool) {
         let (base, authz) = relay(&pool).await;
 
-        let (status, vault) = private_vault(&base, ALICE).await;
+        let (status, workspace) = private_workspace(&base, ALICE).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(vault["name"].is_null());
-        assert_eq!(vault["path"], "Private");
+        assert!(workspace["name"].is_null());
+        assert_eq!(workspace["path"], "Private");
         assert_eq!(
-            vault["url"],
-            format!("automerge:{}", vault["root_doc_id"].as_str().unwrap())
+            workspace["url"],
+            format!("automerge:{}", workspace["root_doc_id"].as_str().unwrap())
         );
-        assert!(vault["created_at"].is_string());
-        assert!(vault["last_change_at"].is_null());
+        assert!(workspace["created_at"].is_string());
+        assert!(workspace["last_change_at"].is_null());
 
-        let root = vault["root_doc_id"].as_str().unwrap().parse().unwrap();
+        let root = workspace["root_doc_id"].as_str().unwrap().parse().unwrap();
         assert!(authz.opens(&auth::Did(ALICE.into()), &root));
         assert!(!authz.opens(&auth::Did(BOB.into()), &root));
 
@@ -610,12 +614,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(own["vaults"].as_array().unwrap().len(), 1);
-        assert_eq!(own["vaults"][0]["root_doc_id"], vault["root_doc_id"]);
-        // In no workspace, and still told the workspaces' folder.
+        assert_eq!(own["vaults"][0]["root_doc_id"], workspace["root_doc_id"]);
+        // In no group, and still told the Workspaces folder.
         assert_eq!(own["folders"], json!(["Private", "Workspaces"]));
 
         let response = reqwest::Client::new()
-            .get(format!("{base}/internal/vaults?did=alice"))
+            .get(format!("{base}/internal/workspaces?did=alice"))
             .bearer_auth(SERVICE_TOKEN)
             .send()
             .await
@@ -624,10 +628,10 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn listings_show_only_the_members_own_vaults(pool: PgPool) {
+    async fn listings_show_only_the_members_own_workspaces(pool: PgPool) {
         let (base, _) = relay(&pool).await;
-        let (_, alices) = private_vault(&base, ALICE).await;
-        let (_, bobs) = private_vault(&base, BOB).await;
+        let (_, alices) = private_workspace(&base, ALICE).await;
+        let (_, bobs) = private_workspace(&base, BOB).await;
         assert_ne!(alices["root_doc_id"], bobs["root_doc_id"]);
 
         let own: Value = reqwest::Client::new()
@@ -643,28 +647,28 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|vault| vault["root_doc_id"].clone())
+            .map(|workspace| workspace["root_doc_id"].clone())
             .collect();
         assert_eq!(roots, [alices["root_doc_id"].clone()]);
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_workspace_vault_lists_for_whoever_the_token_puts_in_it(pool: PgPool) {
+    async fn a_group_workspace_lists_for_whoever_the_token_puts_in_it(pool: PgPool) {
         let (base, _) = relay(&pool).await;
         let client = reqwest::Client::new();
 
-        let response = workspace_vault(&base, ALICE, "7", "Garden").await;
+        let response = group_workspace(&base, ALICE, "7", "Garden").await;
         assert_eq!(response.status(), StatusCode::OK);
-        let vault: Value = response.json().await.unwrap();
-        assert_eq!(vault["workspace"], "7");
-        assert_eq!(vault["path"], "Workspaces/Garden");
+        let workspace: Value = response.json().await.unwrap();
+        assert_eq!(workspace["group_id"], "7");
+        assert_eq!(workspace["path"], "Workspaces/Garden");
 
-        // Asked again by another member: the same vault, and the name sent is
+        // Asked again by another member: the same workspace, and the name sent is
         // the one it carries, which is how a rename in Corliss reaches it.
-        let response = workspace_vault(&base, BOB, "7", " Garden Club ").await;
+        let response = group_workspace(&base, BOB, "7", " Garden Club ").await;
         assert_eq!(response.status(), StatusCode::OK);
         let again: Value = response.json().await.unwrap();
-        assert_eq!(again["root_doc_id"], vault["root_doc_id"]);
+        assert_eq!(again["root_doc_id"], workspace["root_doc_id"]);
         assert_eq!(again["path"], "Workspaces/Garden Club");
 
         let bob_in_7 = TokenSpec::default()
@@ -673,30 +677,30 @@ mod tests {
             .sign();
         let own = client.get(format!("{base}/vaults")).bearer_auth(&bob_in_7);
         assert_eq!(
-            vault_paths(own).await,
+            workspace_paths(own).await,
             ["Workspaces/Garden Club", "Private"]
         );
 
-        // Alice made it, and a token naming no workspace still does not list it.
+        // Alice made it, and a token naming no group still does not list it.
         let alice = client
             .get(format!("{base}/vaults"))
             .bearer_auth(member_token(ALICE));
-        assert_eq!(vault_paths(alice).await, ["Private"]);
+        assert_eq!(workspace_paths(alice).await, ["Private"]);
 
         let for_bob = client
-            .get(format!("{base}/internal/vaults?did={BOB}&workspaces=7,9"))
+            .get(format!("{base}/internal/workspaces?did={BOB}&groups=7,9"))
             .bearer_auth(SERVICE_TOKEN);
         assert_eq!(
-            vault_paths(for_bob).await,
+            workspace_paths(for_bob).await,
             ["Workspaces/Garden Club", "Private"]
         );
 
-        for (did, workspace, name, code) in [
+        for (did, group, name, code) in [
             (BOB, "7", "  ", "invalid_name"),
-            (BOB, "a/b", "Seeds", "invalid_workspace"),
+            (BOB, "a/b", "Seeds", "invalid_group"),
             ("bob", "7", "Seeds", "invalid_did"),
         ] {
-            let response = workspace_vault(&base, did, workspace, name).await;
+            let response = group_workspace(&base, did, group, name).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{code}");
             let answer: Value = response.json().await.unwrap();
             assert_eq!(answer["error"], code);
@@ -704,30 +708,121 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn the_endpoints_before_v0_7_0_keep_their_shape(pool: PgPool) {
+        let (base, _) = relay(&pool).await;
+        let client = reqwest::Client::new();
+        let service = |request: reqwest::RequestBuilder| request.bearer_auth(SERVICE_TOKEN).send();
+
+        // Corliss before the rename asks for a workspace's vault.
+        let response = service(
+            client
+                .put(format!("{base}/internal/vaults/workspace"))
+                .json(&json!({ "did": BOB, "workspace": "7", "name": "Garden" })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let vault: Value = response.json().await.unwrap();
+        assert_eq!(vault["workspace"], "7");
+        assert!(vault.get("group_id").is_none(), "{vault}");
+
+        let listing: Value =
+            service(client.get(format!("{base}/internal/vaults?did={BOB}&workspaces=7")))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(listing["folders"], json!(["Private", "Workspaces"]));
+        let entries: Vec<_> = listing["vaults"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|vault| (vault["path"].clone(), vault["workspace"].clone()))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                (json!("Workspaces/Garden"), json!("7")),
+                (json!("Private"), Value::Null)
+            ]
+        );
+
+        let all: Value = service(client.get(format!("{base}/internal/vaults/all")))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(all["vaults"][0]["owner_did"], BOB);
+        assert_eq!(all["vaults"][0]["workspace"], "7");
+
+        // A plugin up to 1.2.x lists its own.
+        let bob_in_7 = TokenSpec::default()
+            .claim("sub", json!(BOB))
+            .claim("workspaces", json!(["7"]))
+            .sign();
+        let own: Value = client
+            .get(format!("{base}/vaults"))
+            .bearer_auth(&bob_in_7)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(own["vaults"].as_array().unwrap().len(), 2);
+        assert_eq!(own["folders"], json!(["Private", "Workspaces"]));
+
+        let refused = service(
+            client
+                .put(format!("{base}/internal/vaults/workspace"))
+                .json(&json!({ "did": BOB, "workspace": "a/b", "name": "Seeds" })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let answer: Value = refused.json().await.unwrap();
+        assert_eq!(answer["error"], "invalid_workspace");
+
+        // The same workspaces in the new shape.
+        let listing: Value =
+            service(client.get(format!("{base}/internal/workspaces?did={BOB}&groups=7")))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(listing["root_folders"], json!(["Private", "Workspaces"]));
+        assert_eq!(listing["workspaces"][0]["group_id"], "7");
+        assert!(listing["workspaces"][0].get("workspace").is_none());
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn the_admin_listing_is_everyones_and_takes_no_parameters(pool: PgPool) {
         let (base, authz) = relay(&pool).await;
-        private_vault(&base, ALICE).await;
-        private_vault(&base, BOB).await;
-        workspace_vault(&base, BOB, "7", "Garden").await;
-        authz::tests::eventually("every vault is walked", || authz.all_walked()).await;
+        private_workspace(&base, ALICE).await;
+        private_workspace(&base, BOB).await;
+        group_workspace(&base, BOB, "7", "Garden").await;
+        authz::tests::eventually("every workspace is walked", || authz.all_walked()).await;
 
         let client = reqwest::Client::new();
         let all = |query: &str| {
             client
-                .get(format!("{base}/internal/vaults/all{query}"))
+                .get(format!("{base}/internal/workspaces/all{query}"))
                 .bearer_auth(SERVICE_TOKEN)
                 .send()
         };
         let body: Value = all("").await.unwrap().json().await.unwrap();
-        let listed: Vec<_> = body["vaults"]
+        let listed: Vec<_> = body["workspaces"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|vault| {
-                assert!(vault["bytes"].is_i64(), "{vault}");
+            .map(|workspace| {
+                assert!(workspace["bytes"].is_i64(), "{workspace}");
                 (
-                    vault["owner_did"].as_str().unwrap(),
-                    vault["path"].as_str().unwrap(),
+                    workspace["owner_did"].as_str().unwrap(),
+                    workspace["path"].as_str().unwrap(),
                 )
             })
             .collect();
@@ -748,7 +843,7 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(narrowed["vaults"], body["vaults"]);
+        assert_eq!(narrowed["workspaces"], body["workspaces"]);
 
         // The member-facing listings never carry the creator.
         let own: Value = client
@@ -764,14 +859,14 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn vault_endpoints_refuse_the_wrong_credential(pool: PgPool) {
+    async fn workspace_endpoints_refuse_the_wrong_credential(pool: PgPool) {
         let (base, _) = relay(&pool).await;
         let client = reqwest::Client::new();
         let member = member_token(ALICE);
-        let internal = format!("{base}/internal/vaults");
+        let internal = format!("{base}/internal/workspaces");
         let for_alice = format!("{internal}?did={ALICE}");
-        let body = json!({ "did": ALICE, "workspace": "7", "name": "Notes" });
-        let workspace = format!("{internal}/workspace");
+        let body = json!({ "did": ALICE, "group_id": "7", "name": "Notes" });
+        let group = internal.clone();
 
         for request in [
             // The member endpoint: no token, the service credential, a token
@@ -790,9 +885,9 @@ mod tests {
             client.get(&for_alice),
             client.get(&for_alice).bearer_auth("wrong"),
             client.get(&for_alice).bearer_auth(&member),
-            client.put(&workspace).json(&body),
-            client.put(&workspace).json(&body).bearer_auth("wrong"),
-            client.put(&workspace).json(&body).bearer_auth(&member),
+            client.put(&group).json(&body),
+            client.put(&group).json(&body).bearer_auth("wrong"),
+            client.put(&group).json(&body).bearer_auth(&member),
             client.get(format!("{internal}/all")),
             client.get(format!("{internal}/all")).bearer_auth("wrong"),
             client.get(format!("{internal}/all")).bearer_auth(&member),
@@ -803,15 +898,15 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_restart_keeps_vault_records(pool: PgPool) {
+    async fn a_restart_keeps_workspace_records(pool: PgPool) {
         let (base, _) = relay(&pool).await;
-        private_vault(&base, ALICE).await;
+        private_workspace(&base, ALICE).await;
 
         let (base, _) = relay(&pool).await;
         let own = reqwest::Client::new()
             .get(format!("{base}/vaults"))
             .bearer_auth(member_token(ALICE));
-        assert_eq!(vault_paths(own).await, ["Private"]);
+        assert_eq!(workspace_paths(own).await, ["Private"]);
     }
 
     /// Dials the relay's websocket the way a sync client does, token in the
@@ -918,10 +1013,10 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_vault_root_reaches_its_owner_only(pool: PgPool) {
+    async fn a_workspace_root_reaches_its_owner_only(pool: PgPool) {
         let (base, _) = relay(&pool).await;
-        let (_, vault) = private_vault(&base, ALICE).await;
-        let root: samod::DocumentId = vault["root_doc_id"].as_str().unwrap().parse().unwrap();
+        let (_, workspace) = private_workspace(&base, ALICE).await;
+        let root: samod::DocumentId = workspace["root_doc_id"].as_str().unwrap().parse().unwrap();
 
         let alice = client(&base, ALICE).await;
         assert!(alice.find(root.clone()).await.unwrap().is_some());
@@ -999,12 +1094,12 @@ mod tests {
             self.mcp_token_in(did, &[])
         }
 
-        /// An MCP token for a member in these workspaces.
-        fn mcp_token_in(&self, did: &str, workspaces: &[&str]) -> String {
+        /// An MCP token for a member in these groups.
+        fn mcp_token_in(&self, did: &str, groups: &[&str]) -> String {
             TokenSpec::default()
                 .claim("sub", json!(did))
                 .claim("aud", json!(self.mcp))
-                .claim("workspaces", json!(workspaces))
+                .claim("workspaces", json!(groups))
                 .sign()
         }
 
@@ -1026,17 +1121,17 @@ mod tests {
             self.call_in(did, &[], tool, arguments).await
         }
 
-        /// [`Relay::call`] for a member in these workspaces.
+        /// [`Relay::call`] for a member in these groups.
         async fn call_in(
             &self,
             did: &str,
-            workspaces: &[&str],
+            groups: &[&str],
             tool: &str,
             arguments: Value,
         ) -> (bool, String) {
             let response = self
                 .rpc(
-                    Some(&self.mcp_token_in(did, workspaces)),
+                    Some(&self.mcp_token_in(did, groups)),
                     "tools/call",
                     json!({ "name": tool, "arguments": arguments }),
                 )
@@ -1114,17 +1209,17 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn mcp_groups_vaults_as_private_and_workspaces(pool: PgPool) {
+    async fn mcp_lists_private_and_group_workspaces(pool: PgPool) {
         let relay = start(&pool).await;
-        // Created under one name and renamed with its workspace.
+        // Created under one name and renamed with its group.
         relay
             .authz
-            .workspace_vault(&auth::Did(ALICE.into()), "7", "Old name")
+            .group_workspace(&auth::Did(ALICE.into()), "7", "Old name")
             .await
             .unwrap();
         relay
             .authz
-            .workspace_vault(&auth::Did(ALICE.into()), "7", "Notes")
+            .group_workspace(&auth::Did(ALICE.into()), "7", "Notes")
             .await
             .unwrap();
         let in_7 = ["7"];
@@ -1134,19 +1229,19 @@ mod tests {
                 ALICE,
                 &in_7,
                 "create_note",
-                json!({ "vault": "Workspaces/Notes", "path": "plan.md", "content": "dig beds" }),
+                json!({ "workspace": "Workspaces/Notes", "path": "plan.md", "content": "dig beds" }),
             )
             .await;
         assert!(!is_error, "{text}");
 
         // Until the index walks the folder, the note is Alice's alone.
-        let alice = auth::Caller::in_workspaces(auth::Did(ALICE.into()), vec!["7".into()]);
+        let alice = auth::Caller::in_groups(auth::Did(ALICE.into()), vec!["7".into()]);
         let mut walked = false;
         for _ in 0..200 {
-            let vaults = relay.authz.list_vaults(&alice).await.unwrap();
-            let shared = vaults
+            let workspaces = relay.authz.list_workspaces(&alice).await.unwrap();
+            let shared = workspaces
                 .iter()
-                .find(|vault| vault.workspace.is_some())
+                .find(|workspace| workspace.group_id.is_some())
                 .unwrap();
             if shared.note_count == Some(1) {
                 walked = true;
@@ -1154,11 +1249,13 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(walked, "the note never joined the vault");
+        assert!(walked, "the note never joined the workspace");
 
-        // Bob's vaults, in their two groups. His private vault is made by
+        // Bob's workspaces, in their two groups. His private workspace is made by
         // this first listing.
-        let (is_error, text) = relay.call_in(BOB, &in_7, "list_vaults", json!({})).await;
+        let (is_error, text) = relay
+            .call_in(BOB, &in_7, "list_workspaces", json!({}))
+            .await;
         assert!(!is_error, "{text}");
         let listed: Value = serde_json::from_str(&text).unwrap();
         let named = |group: &str| -> Vec<String> {
@@ -1166,28 +1263,28 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|vault| vault["vault"].as_str().unwrap().to_string())
+                .map(|workspace| workspace["workspace"].as_str().unwrap().to_string())
                 .collect()
         };
         assert_eq!(named("Private"), ["Private"]);
         assert_eq!(named("Workspaces"), ["Workspaces/Notes"]);
         assert!(listed["Private"][0]["name"].is_null());
 
-        // The workspace's vault by its full path or its bare name.
-        for vault in ["workspaces/Notes", "notes"] {
+        // The group's workspace by its full path or its bare name.
+        for workspace in ["workspaces/Notes", "notes"] {
             let (is_error, text) = relay
                 .call_in(
                     BOB,
                     &in_7,
                     "read_note",
-                    json!({ "vault": vault, "path": "plan.md" }),
+                    json!({ "workspace": workspace, "path": "plan.md" }),
                 )
                 .await;
-            assert!(!is_error, "{vault}: {text}");
+            assert!(!is_error, "{workspace}: {text}");
             assert!(text.contains("dig beds"), "{text}");
         }
 
-        // No vault named is his private vault, which "Private" names too.
+        // No workspace named is his private workspace, which "Private" names too.
         let (is_error, text) = relay
             .call_in(
                 BOB,
@@ -1203,7 +1300,7 @@ mod tests {
                 BOB,
                 &in_7,
                 "read_note",
-                json!({ "vault": "private", "path": "mine.md" }),
+                json!({ "workspace": "private", "path": "mine.md" }),
             )
             .await;
         assert!(!is_error, "{text}");
@@ -1215,21 +1312,21 @@ mod tests {
                 BOB,
                 &in_7,
                 "read_note",
-                json!({ "vault": "Private/Notes", "path": "mine.md" }),
+                json!({ "workspace": "Private/Notes", "path": "mine.md" }),
             )
             .await;
         assert!(is_error);
         assert!(why.contains("no name after it"), "{why}");
 
-        // Without the workspace in his token, there is no such vault.
+        // Without the group in his token, there is no such workspace.
         let why = relay
             .refused(
                 BOB,
                 "read_note",
-                json!({ "vault": "Workspaces/Notes", "path": "plan.md" }),
+                json!({ "workspace": "Workspaces/Notes", "path": "plan.md" }),
             )
             .await;
-        assert!(why.contains("no vault"), "{why}");
+        assert!(why.contains("no workspace"), "{why}");
     }
 
     #[sqlx::test(migrations = false)]
@@ -1297,7 +1394,7 @@ mod tests {
                 "create_note",
                 "edit_note",
                 "list_notes",
-                "list_vaults",
+                "list_workspaces",
                 "read_note",
                 "search_notes"
             ]
@@ -1307,11 +1404,11 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn a_member_creates_reads_edits_and_searches_notes(pool: PgPool) {
         let relay = start(&pool).await;
-        private_vault(&relay.base, ALICE).await;
+        private_workspace(&relay.base, ALICE).await;
 
         // No initialize was ever sent: every call stands on its own token.
         assert!(relay
-            .ok(ALICE, "list_vaults", json!({}))
+            .ok(ALICE, "list_workspaces", json!({}))
             .await
             .contains("Private"));
         assert_eq!(
@@ -1414,7 +1511,7 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn tools_refuse_what_they_should(pool: PgPool) {
         let relay = start(&pool).await;
-        private_vault(&relay.base, ALICE).await;
+        private_workspace(&relay.base, ALICE).await;
         relay
             .ok(
                 ALICE,
@@ -1450,7 +1547,7 @@ mod tests {
                 json!({ "path": "a.md", "old_text": "", "new_text": "x" }),
             ),
             ("append_note", json!({ "path": "missing.md", "text": "x" })),
-            ("read_note", json!({ "vault": "Other", "path": "a.md" })),
+            ("read_note", json!({ "workspace": "Other", "path": "a.md" })),
             ("search_notes", json!({ "query": "  " })),
         ] {
             relay.refused(ALICE, tool, arguments).await;
@@ -1477,9 +1574,9 @@ mod tests {
             "1 two 1"
         );
 
-        // A workspace's vault does not change what no vault named means: it
-        // is still her private vault.
-        workspace_vault(&relay.base, ALICE, "7", "Garden").await;
+        // A group's workspace does not change what no workspace named means: it
+        // is still her private workspace.
+        group_workspace(&relay.base, ALICE, "7", "Garden").await;
         let in_7 = ["7"];
         let (is_error, text) = relay
             .call_in(ALICE, &in_7, "read_note", json!({ "path": "a.md" }))
@@ -1491,7 +1588,7 @@ mod tests {
                 ALICE,
                 &in_7,
                 "read_note",
-                json!({ "vault": "Garden", "path": "a.md" }),
+                json!({ "workspace": "Garden", "path": "a.md" }),
             )
             .await;
         assert!(is_error);
@@ -1500,8 +1597,8 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn tools_never_reach_another_members_notes(pool: PgPool) {
         let relay = start(&pool).await;
-        private_vault(&relay.base, ALICE).await;
-        let (_, bobs) = private_vault(&relay.base, BOB).await;
+        private_workspace(&relay.base, ALICE).await;
+        let (_, bobs) = private_workspace(&relay.base, BOB).await;
         relay
             .ok(
                 ALICE,
@@ -1510,7 +1607,7 @@ mod tests {
             )
             .await;
 
-        // Same vault name, his own vault: hers is not in it.
+        // Same workspace name, his own workspace: hers is not in it.
         assert!(paths(
             &relay
                 .ok(BOB, "list_notes", json!({ "recursive": true }))
@@ -1582,13 +1679,17 @@ mod tests {
         use automerge::{transaction::Transactable, ReadDoc};
 
         let relay = start(&pool).await;
-        let (_, vault) = private_vault(&relay.base, ALICE).await;
-        let root: samod::DocumentId = vault["root_doc_id"].as_str().unwrap().parse().unwrap();
+        let (_, workspace) = private_workspace(&relay.base, ALICE).await;
+        let root: samod::DocumentId = workspace["root_doc_id"].as_str().unwrap().parse().unwrap();
 
-        // Her device is connected and syncing the vault's root before
+        // Her device is connected and syncing the workspace's root before
         // anything is written.
         let device = client(&relay.base, ALICE).await;
-        let folder = device.find(root).await.unwrap().expect("the vault root");
+        let folder = device
+            .find(root)
+            .await
+            .unwrap()
+            .expect("the workspace root");
 
         relay
             .ok(

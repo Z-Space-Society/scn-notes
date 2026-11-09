@@ -1,14 +1,14 @@
-//! What the tools do to a vault's documents.
+//! What the tools do to a workspace's documents.
 //!
-//! A tool addresses a note by vault and path. The path is resolved by walking
-//! folder documents from the vault's root at the time of the call, so a note
+//! A tool addresses a note by workspace and path. The path is resolved by walking
+//! folder documents from the workspace's root at the time of the call, so a note
 //! with no folder entry cannot be reached by any tool, and a note that has
 //! moved is found where it now is.
 //!
 //! Every document touched is checked twice over: through [`Authz::may_open`],
-//! and against the vault's admission rule ([`crate::authz::Holder::admits`]).
+//! and against the workspace's admission rule ([`crate::authz::Holder::admits`]).
 //! The second is what stops a link someone wrote into a folder from leading to
-//! a document the vault does not hold.
+//! a document the workspace does not hold.
 //!
 //! Writes are splices into a note's text. Nothing here replaces a note whole:
 //! a replace would discard whatever another device typed in the meantime.
@@ -68,14 +68,14 @@ pub struct Found {
     pub id: DocumentId,
 }
 
-/// One caller's view of the vaults: everything here acts as `caller`.
+/// One caller's view of the workspaces: everything here acts as `caller`.
 pub struct Notes<'a> {
     pub authz: &'a Authz,
     pub caller: &'a Caller,
 }
 
-/// Split `Private/<name>` or `Workspaces/<name>`, in any letter case, into
-/// whether it names a workspace's vault and the bare name. `None` for a name
+/// Split `Private` or `Workspaces/<name>`, in any letter case, into
+/// whether it names a group's workspace and the bare name. `None` for a name
 /// with neither prefix.
 fn split_group(name: &str) -> Option<(bool, &str)> {
     let (group, rest) = name.split_once('/')?;
@@ -193,8 +193,8 @@ impl Notes<'_> {
     /// May the caller reach this document through this folder?
     ///
     /// A folder the index has not walked yet, one a tool made a moment ago,
-    /// is in no vault so far. Then only what the caller made is reachable
-    /// through it, which is the rule that held before workspaces.
+    /// is in no workspace so far. Then only what the caller made is reachable
+    /// through it, which is the rule that held before groups.
     fn admitted(&self, folder: &DocumentId, doc: &DocumentId) -> bool {
         if !self.authz.may_open(self.caller, doc) {
             return false;
@@ -212,40 +212,42 @@ impl Notes<'_> {
         match self.authz.open(doc).await {
             Some(handle) => Ok(handle),
             None => Err(NoteError::Internal(anyhow::anyhow!(
-                "document {doc} is linked from a vault and would not load"
+                "document {doc} is linked from a workspace and would not load"
             ))),
         }
     }
 
-    /// Find one of the caller's vaults. Returns its root document and its
+    /// Find one of the caller's workspaces. Returns its root document and its
     /// `path`.
     ///
-    /// Left out, or named `Private`, it is the caller's private vault, which
-    /// every member has. A workspace's vault is `Workspaces/<name>`, matching
-    /// `list_vaults`, or its bare name. Two workspaces sharing a name are
+    /// Left out, or named `Private`, it is the caller's private workspace, which
+    /// every member has. A group's workspace is `Workspaces/<name>`, matching
+    /// `list_workspaces`, or its bare name. Two groups sharing a name are
     /// refused rather than guessed between, since a write to the wrong one
     /// would land where other members can read it.
-    pub async fn vault(&self, name: Option<&str>) -> Result<(DocumentId, String)> {
-        let vaults = self.authz.list_vaults(self.caller).await?;
+    pub async fn workspace(&self, name: Option<&str>) -> Result<(DocumentId, String)> {
+        let workspaces = self.authz.list_workspaces(self.caller).await?;
         let wanted = name.map(str::trim).filter(|name| !name.is_empty());
         let chosen = match wanted {
-            None => vaults.iter().find(|vault| vault.workspace.is_none()),
-            Some(wanted) if key(wanted) == key(PRIVATE) => {
-                vaults.iter().find(|vault| vault.workspace.is_none())
-            }
+            None => workspaces
+                .iter()
+                .find(|workspace| workspace.group_id.is_none()),
+            Some(wanted) if key(wanted) == key(PRIVATE) => workspaces
+                .iter()
+                .find(|workspace| workspace.group_id.is_none()),
             Some(wanted) => {
                 let bare = match split_group(wanted) {
                     Some((true, bare)) => bare,
                     Some((false, _)) => {
                         return refuse(format!(
-                            "your private vault is {PRIVATE:?}; it has no name after it"
+                            "your private workspace is {PRIVATE:?}; it has no name after it"
                         ));
                     }
                     None => wanted,
                 };
-                let mut named = vaults.iter().filter(|vault| {
-                    vault.workspace.is_some()
-                        && vault
+                let mut named = workspaces.iter().filter(|workspace| {
+                    workspace.group_id.is_some()
+                        && workspace
                             .name
                             .as_deref()
                             .is_some_and(|name| key(name) == key(bare))
@@ -253,7 +255,7 @@ impl Notes<'_> {
                 let first = named.next();
                 if named.next().is_some() {
                     return refuse(format!(
-                        "more than one vault is named {:?}; two workspaces share that name, \
+                        "more than one workspace is named {:?}; two workspaces have that name, \
                          and one of them needs renaming in Corliss",
                         format!("{WORKSPACES}/{bare}")
                     ));
@@ -262,11 +264,12 @@ impl Notes<'_> {
             }
         };
         match chosen {
-            Some(vault) => Ok((
-                DocumentId::from_str(&vault.root_doc_id).map_err(|e| anyhow::anyhow!("{e:?}"))?,
-                vault.path.clone(),
+            Some(workspace) => Ok((
+                DocumentId::from_str(&workspace.root_doc_id)
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+                workspace.path.clone(),
             )),
-            None => refuse("no vault by that name; list_vaults shows the ones you have"),
+            None => refuse("no workspace by that name; list_workspaces shows the ones you have"),
         }
     }
 
@@ -323,7 +326,7 @@ impl Notes<'_> {
             .find(|item| key(&item.name) == wanted))
     }
 
-    /// Follow a path from a vault's root. An empty path is the root itself.
+    /// Follow a path from a workspace's root. An empty path is the root itself.
     ///
     /// Returns what the path leads to, and the path as the folders spell it,
     /// which may differ from the one asked for in letter case.
