@@ -682,7 +682,7 @@ mod tests {
             authz: &authz,
             caller: &caller,
         };
-        let (root, _) = notes.workspace(None).await.unwrap();
+        let root = notes.locate("Private").await.unwrap().root;
         notes.create(&root, "Plans/a.md", "one").await.unwrap();
         notes
             .edit(&root, "Plans/a.md", "one".into(), "two".into(), false)

@@ -1,13 +1,11 @@
-//! Text search across one workspace.
+//! Text search across the caller's workspaces, or one workspace or folder.
 //!
-//! Each search walks the workspace's folders and reads its notes from the
+//! Each search walks the folders in scope and reads its notes from the
 //! documents the relay already holds in memory. Nothing is kept between
 //! searches, so there is no index to fall out of step: a note that was deleted
 //! is not found, and a note that moved is found at its new path.
 
-use samod::DocumentId;
-
-use super::notes::{NoteError, Notes};
+use super::notes::{Located, NoteError, Notes};
 
 /// The longest a line quoted in a result may be, in characters.
 const SNIPPET_CHARS: usize = 200;
@@ -65,10 +63,11 @@ fn score(path: &str, text: &str, terms: &[String]) -> Option<Hit> {
     })
 }
 
-/// The notes in a workspace that contain every word of the query, best first.
+/// The notes in scope that contain every word of the query, best first.
+/// Paths start with their workspace.
 pub async fn search(
     notes: &Notes<'_>,
-    root: &DocumentId,
+    scopes: &[Located],
     query: &str,
     limit: usize,
 ) -> Result<Vec<Hit>, NoteError> {
@@ -78,19 +77,21 @@ pub async fn search(
     }
 
     let mut hits = Vec::new();
-    for found in notes.list(root, "", true).await? {
-        if found.is_folder {
-            continue;
+    for scope in scopes {
+        for found in notes.list(&scope.root, &scope.rest, true).await? {
+            if found.is_folder {
+                continue;
+            }
+            // A note that will not load or has no text is skipped, not fatal:
+            // one bad document should not hide the rest of the workspace.
+            let Some(handle) = notes.authz.open(&found.id).await else {
+                continue;
+            };
+            let Ok(text) = notes.read_doc(&handle).await else {
+                continue;
+            };
+            hits.extend(score(&scope.full(&found.path), &text, &terms));
         }
-        // A note that will not load or has no text is skipped, not fatal:
-        // one bad document should not hide the rest of the workspace.
-        let Some(handle) = notes.authz.open(&found.id).await else {
-            continue;
-        };
-        let Ok(text) = notes.read_doc(&handle).await else {
-            continue;
-        };
-        hits.extend(score(&found.path, &text, &terms));
     }
 
     hits.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path)));

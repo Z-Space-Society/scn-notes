@@ -1,9 +1,11 @@
 //! What the tools do to a workspace's documents.
 //!
-//! A tool addresses a note by workspace and path. The path is resolved by walking
-//! folder documents from the workspace's root at the time of the call, so a note
-//! with no folder entry cannot be reached by any tool, and a note that has
-//! moved is found where it now is.
+//! A tool addresses a note by one path that starts with its workspace:
+//! `Private/...` for the caller's own, `Workspaces/<name>/...` for a shared
+//! one, the same paths the Obsidian plugin puts files at. The rest of the
+//! path is resolved by walking folder documents from the workspace's root at
+//! the time of the call, so a note with no folder entry cannot be reached by
+//! any tool, and a note that has moved is found where it now is.
 //!
 //! Every document touched is checked twice over: through [`Authz::may_open`],
 //! and against the workspace's admission rule ([`crate::authz::Holder::admits`]).
@@ -25,7 +27,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::actors::as_actor;
 use crate::auth::Caller;
-use crate::authz::{Authz, PRIVATE, WORKSPACES};
+use crate::authz::{Authz, Workspace, PRIVATE, WORKSPACES};
 use crate::reach::{self, Entry, FOLDER, NOTE};
 
 /// Why a tool could not do what it was asked.
@@ -68,25 +70,73 @@ pub struct Found {
     pub id: DocumentId,
 }
 
+/// A workspace a path names, and the rest of the path inside it.
+#[derive(Clone, Debug)]
+pub struct Located {
+    pub root: DocumentId,
+    /// The workspace's own path: `Private` or `Workspaces/<name>`.
+    pub workspace: String,
+    /// The path inside the workspace, empty for its top level.
+    pub rest: String,
+}
+
+impl Located {
+    /// A path inside this workspace, written out in full.
+    pub fn full(&self, inside: &str) -> String {
+        in_workspace(&self.workspace, inside)
+    }
+}
+
+/// `inside` written out in full, starting with its workspace.
+pub fn in_workspace(workspace: &str, inside: &str) -> String {
+    if inside.is_empty() {
+        workspace.to_string()
+    } else {
+        format!("{workspace}/{inside}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Workspace,
+    Folder,
+    Note,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Workspace => "workspace",
+            Kind::Folder => "folder",
+            Kind::Note => "note",
+        }
+    }
+}
+
+/// A listing entry, with its path written out in full.
+#[derive(Clone, Debug)]
+pub struct Listed {
+    pub path: String,
+    pub kind: Kind,
+}
+
+impl Listed {
+    fn found(workspace: &str, found: Found) -> Self {
+        Listed {
+            path: in_workspace(workspace, &found.path),
+            kind: if found.is_folder {
+                Kind::Folder
+            } else {
+                Kind::Note
+            },
+        }
+    }
+}
+
 /// One caller's view of the workspaces: everything here acts as `caller`.
 pub struct Notes<'a> {
     pub authz: &'a Authz,
     pub caller: &'a Caller,
-}
-
-/// Split `Private` or `Workspaces/<name>`, in any letter case, into
-/// whether it names a group's workspace and the bare name. `None` for a name
-/// with neither prefix.
-fn split_group(name: &str) -> Option<(bool, &str)> {
-    let (group, rest) = name.split_once('/')?;
-    let rest = rest.trim();
-    if group.trim().eq_ignore_ascii_case(PRIVATE) {
-        Some((false, rest))
-    } else if group.trim().eq_ignore_ascii_case(WORKSPACES) {
-        Some((true, rest))
-    } else {
-        None
-    }
 }
 
 /// How two names are compared: equal after NFC and case folding. macOS and
@@ -217,60 +267,127 @@ impl Notes<'_> {
         }
     }
 
-    /// Find one of the caller's workspaces. Returns its root document and its
-    /// `path`.
+    /// The caller's workspaces: their Private workspace first, which every
+    /// member has, then the shared ones by path.
+    pub async fn workspaces(&self) -> Result<Vec<Workspace>> {
+        let mut workspaces = self.authz.list_workspaces(self.caller).await?;
+        workspaces.sort_by_key(|w| (w.group_id.is_some(), key(&w.path)));
+        Ok(workspaces)
+    }
+
+    /// Where a full path leads: the workspace its first part names, and the
+    /// rest of the path inside it.
     ///
-    /// Left out, or named `Private`, it is the caller's private workspace, which
-    /// every member has. A group's workspace is `Workspaces/<name>`, matching
-    /// `list_workspaces`, or its bare name. Two groups sharing a name are
-    /// refused rather than guessed between, since a write to the wrong one
-    /// would land where other members can read it.
-    pub async fn workspace(&self, name: Option<&str>) -> Result<(DocumentId, String)> {
-        let workspaces = self.authz.list_workspaces(self.caller).await?;
-        let wanted = name.map(str::trim).filter(|name| !name.is_empty());
-        let chosen = match wanted {
-            None => workspaces
-                .iter()
-                .find(|workspace| workspace.group_id.is_none()),
-            Some(wanted) if key(wanted) == key(PRIVATE) => workspaces
-                .iter()
-                .find(|workspace| workspace.group_id.is_none()),
-            Some(wanted) => {
-                let bare = match split_group(wanted) {
-                    Some((true, bare)) => bare,
-                    Some((false, _)) => {
-                        return refuse(format!(
-                            "your private workspace is {PRIVATE:?}; it has no name after it"
-                        ));
-                    }
-                    None => wanted,
+    /// `Private/...` is the caller's Private workspace. `Workspaces/<name>/...`
+    /// is the shared workspace of that name, in any letter case. Two shared
+    /// workspaces with one name are refused rather than guessed between, since
+    /// a write to the wrong one would land where other members can read it.
+    pub async fn locate(&self, path: &str) -> Result<Located> {
+        let parts = segments(path)?;
+        let workspaces = self.workspaces().await?;
+        let (chosen, used) = match parts.first() {
+            Some(first) if key(first) == key(PRIVATE) => {
+                (workspaces.iter().find(|w| w.group_id.is_none()), 1)
+            }
+            Some(first) if key(first) == key(WORKSPACES) => {
+                let Some(name) = parts.get(1) else {
+                    return refuse(format!(
+                        "{WORKSPACES} holds your shared workspaces; name one, as in \
+                         {WORKSPACES}/<name>/plan.md. list_notes with path {WORKSPACES:?} \
+                         shows them"
+                    ));
                 };
-                let mut named = workspaces.iter().filter(|workspace| {
-                    workspace.group_id.is_some()
-                        && workspace
-                            .name
-                            .as_deref()
-                            .is_some_and(|name| key(name) == key(bare))
+                let mut named = workspaces.iter().filter(|w| {
+                    w.group_id.is_some() && w.name.as_deref().is_some_and(|n| key(n) == key(name))
                 });
                 let first = named.next();
                 if named.next().is_some() {
                     return refuse(format!(
-                        "more than one workspace is named {:?}; two workspaces have that name, \
-                         and one of them needs renaming in Corliss",
-                        format!("{WORKSPACES}/{bare}")
+                        "two shared workspaces are named {:?}; one of them needs renaming \
+                         in Corliss",
+                        format!("{WORKSPACES}/{name}")
                     ));
                 }
-                first
+                if first.is_none() {
+                    return refuse(format!(
+                        "you have no shared workspace named {name:?}; list_notes with path \
+                         {WORKSPACES:?} shows the ones you have"
+                    ));
+                }
+                (first, 2)
+            }
+            _ => {
+                return refuse(format!(
+                    "{path:?} is in no workspace: a path starts with {PRIVATE}/ or \
+                     {WORKSPACES}/<name>/. list_notes with no path shows your workspaces"
+                ))
             }
         };
-        match chosen {
-            Some(workspace) => Ok((
-                DocumentId::from_str(&workspace.root_doc_id)
-                    .map_err(|e| anyhow::anyhow!("{e:?}"))?,
-                workspace.path.clone(),
-            )),
-            None => refuse("no workspace by that name; list_workspaces shows the ones you have"),
+        let workspace =
+            chosen.ok_or_else(|| anyhow::anyhow!("the caller has no Private workspace"))?;
+        Ok(Located {
+            root: DocumentId::from_str(&workspace.root_doc_id)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+            workspace: workspace.path.clone(),
+            rest: parts[used..].join("/"),
+        })
+    }
+
+    /// Where a search looks: everything the caller can open with no path,
+    /// every shared workspace at `Workspaces`, or one workspace or folder.
+    pub async fn scopes(&self, path: &str) -> Result<Vec<Located>> {
+        let parts = segments(path)?;
+        let top = parts.is_empty();
+        if top || (parts.len() == 1 && key(parts[0]) == key(WORKSPACES)) {
+            let mut scopes = Vec::new();
+            for workspace in self.workspaces().await? {
+                if top || workspace.group_id.is_some() {
+                    scopes.push(Located {
+                        root: DocumentId::from_str(&workspace.root_doc_id)
+                            .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+                        workspace: workspace.path.clone(),
+                        rest: String::new(),
+                    });
+                }
+            }
+            return Ok(scopes);
         }
+        Ok(vec![self.locate(path).await?])
+    }
+
+    /// What a path lists: the caller's workspaces at the top, the shared ones
+    /// at `Workspaces`, and a workspace's folders below that. Every path
+    /// returned starts with its workspace.
+    pub async fn list_anywhere(&self, path: &str, recursive: bool) -> Result<Vec<Listed>> {
+        let parts = segments(path)?;
+        let top = parts.is_empty();
+        if top || (parts.len() == 1 && key(parts[0]) == key(WORKSPACES)) {
+            let mut listed = Vec::new();
+            for workspace in self.workspaces().await? {
+                if !top && workspace.group_id.is_none() {
+                    continue;
+                }
+                listed.push(Listed {
+                    path: workspace.path.clone(),
+                    kind: Kind::Workspace,
+                });
+                if recursive {
+                    let root = DocumentId::from_str(&workspace.root_doc_id)
+                        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    for found in self.list(&root, "", true).await? {
+                        listed.push(Listed::found(&workspace.path, found));
+                    }
+                }
+            }
+            return Ok(listed);
+        }
+        let located = self.locate(path).await?;
+        Ok(self
+            .list(&located.root, &located.rest, recursive)
+            .await?
+            .into_iter()
+            .map(|found| Listed::found(&located.workspace, found))
+            .collect())
     }
 
     /// Every entry of a folder as written, whatever its type or owner.

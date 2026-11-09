@@ -1209,7 +1209,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn mcp_lists_private_and_group_workspaces(pool: PgPool) {
+    async fn mcp_paths_start_with_their_workspace(pool: PgPool) {
         let relay = start(&pool).await;
         // Created under one name and renamed with its group.
         relay
@@ -1229,10 +1229,11 @@ mod tests {
                 ALICE,
                 &in_7,
                 "create_note",
-                json!({ "workspace": "Workspaces/Notes", "path": "plan.md", "content": "dig beds" }),
+                json!({ "path": "Workspaces/Notes/plan.md", "content": "dig beds" }),
             )
             .await;
         assert!(!is_error, "{text}");
+        assert_eq!(text, "Created Workspaces/Notes/plan.md.");
 
         // Until the index walks the folder, the note is Alice's alone.
         let alice = auth::Caller::in_groups(auth::Did(ALICE.into()), vec!["7".into()]);
@@ -1251,82 +1252,109 @@ mod tests {
         }
         assert!(walked, "the note never joined the workspace");
 
-        // Bob's workspaces, in their two groups. His private workspace is made by
-        // this first listing.
-        let (is_error, text) = relay
-            .call_in(BOB, &in_7, "list_workspaces", json!({}))
-            .await;
-        assert!(!is_error, "{text}");
-        let listed: Value = serde_json::from_str(&text).unwrap();
-        let named = |group: &str| -> Vec<String> {
-            listed[group]
+        // With no path, Bob's workspaces. His Private one is made by this
+        // first listing.
+        let relay = &relay;
+        let list = |arguments: Value| async move {
+            let (is_error, text) = relay.call_in(BOB, &in_7, "list_notes", arguments).await;
+            assert!(!is_error, "{text}");
+            let listed: Value = serde_json::from_str(&text).unwrap();
+            listed
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|workspace| workspace["workspace"].as_str().unwrap().to_string())
-                .collect()
+                .map(|item| {
+                    format!(
+                        "{} {}",
+                        item["type"].as_str().unwrap(),
+                        item["path"].as_str().unwrap()
+                    )
+                })
+                .collect::<Vec<_>>()
         };
-        assert_eq!(named("Private"), ["Private"]);
-        assert_eq!(named("Workspaces"), ["Workspaces/Notes"]);
-        assert!(listed["Private"][0]["name"].is_null());
+        assert_eq!(
+            list(json!({})).await,
+            ["workspace Private", "workspace Workspaces/Notes"]
+        );
+        assert_eq!(
+            list(json!({ "path": "Workspaces" })).await,
+            ["workspace Workspaces/Notes"]
+        );
+        assert_eq!(
+            list(json!({ "path": "workspaces/notes" })).await,
+            ["note Workspaces/Notes/plan.md"]
+        );
+        assert_eq!(
+            list(json!({ "recursive": true })).await,
+            [
+                "workspace Private",
+                "workspace Workspaces/Notes",
+                "note Workspaces/Notes/plan.md"
+            ]
+        );
 
-        // The group's workspace by its full path or its bare name.
-        for workspace in ["workspaces/Notes", "notes"] {
-            let (is_error, text) = relay
-                .call_in(
-                    BOB,
-                    &in_7,
-                    "read_note",
-                    json!({ "workspace": workspace, "path": "plan.md" }),
-                )
-                .await;
-            assert!(!is_error, "{workspace}: {text}");
-            assert!(text.contains("dig beds"), "{text}");
-        }
+        // Any letter case reaches it.
+        let (is_error, text) = relay
+            .call_in(
+                BOB,
+                &in_7,
+                "read_note",
+                json!({ "path": "workspaces/notes/plan.md" }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+        assert_eq!(text, "dig beds");
 
-        // No workspace named is his private workspace, which "Private" names too.
+        // Private is his own.
         let (is_error, text) = relay
             .call_in(
                 BOB,
                 &in_7,
                 "create_note",
-                json!({ "path": "mine.md", "content": "just me" }),
+                json!({ "path": "Private/mine.md", "content": "just me" }),
             )
             .await;
         assert!(!is_error, "{text}");
-        assert!(text.contains("Private"), "{text}");
-        let (is_error, text) = relay
-            .call_in(
-                BOB,
-                &in_7,
-                "read_note",
-                json!({ "workspace": "private", "path": "mine.md" }),
-            )
-            .await;
-        assert!(!is_error, "{text}");
-        assert!(text.contains("just me"), "{text}");
+        assert_eq!(text, "Created Private/mine.md.");
 
-        // The old private path names nothing now.
-        let (is_error, why) = relay
-            .call_in(
-                BOB,
-                &in_7,
-                "read_note",
-                json!({ "workspace": "Private/Notes", "path": "mine.md" }),
-            )
-            .await;
-        assert!(is_error);
-        assert!(why.contains("no name after it"), "{why}");
+        // Search covers every workspace unless given a path.
+        let found = |arguments: Value| async move {
+            let (is_error, text) = relay.call_in(BOB, &in_7, "search_notes", arguments).await;
+            assert!(!is_error, "{text}");
+            paths(&text)
+        };
+        assert_eq!(
+            found(json!({ "query": "beds" })).await,
+            ["Workspaces/Notes/plan.md"]
+        );
+        assert_eq!(found(json!({ "query": "just" })).await, ["Private/mine.md"]);
+        assert!(found(json!({ "query": "beds", "path": "Private" }))
+            .await
+            .is_empty());
+
+        // A path has to start with a workspace he has.
+        for (path, why) in [
+            ("mine.md", "in no workspace"),
+            ("Projects/mine.md", "in no workspace"),
+            ("Workspaces", "name one"),
+            ("Workspaces/Garden/plan.md", "no shared workspace named"),
+        ] {
+            let (is_error, text) = relay
+                .call_in(BOB, &in_7, "read_note", json!({ "path": path }))
+                .await;
+            assert!(is_error, "{path}: {text}");
+            assert!(text.contains(why), "{path}: {text}");
+        }
 
         // Without the group in his token, there is no such workspace.
         let why = relay
             .refused(
                 BOB,
                 "read_note",
-                json!({ "workspace": "Workspaces/Notes", "path": "plan.md" }),
+                json!({ "path": "Workspaces/Notes/plan.md" }),
             )
             .await;
-        assert!(why.contains("no workspace"), "{why}");
+        assert!(why.contains("no shared workspace named"), "{why}");
     }
 
     #[sqlx::test(migrations = false)]
@@ -1394,7 +1422,6 @@ mod tests {
                 "create_note",
                 "edit_note",
                 "list_notes",
-                "list_workspaces",
                 "read_note",
                 "search_notes"
             ]
@@ -1407,12 +1434,12 @@ mod tests {
         private_workspace(&relay.base, ALICE).await;
 
         // No initialize was ever sent: every call stands on its own token.
-        assert!(relay
-            .ok(ALICE, "list_workspaces", json!({}))
-            .await
-            .contains("Private"));
         assert_eq!(
-            paths(&relay.ok(ALICE, "list_notes", json!({})).await),
+            paths(
+                &relay
+                    .ok(ALICE, "list_notes", json!({ "path": "Private" }))
+                    .await
+            ),
             [""; 0]
         );
 
@@ -1420,36 +1447,48 @@ mod tests {
             .ok(
                 ALICE,
                 "create_note",
-                json!({ "path": "Projects/plan.md", "content": "# Plan\nShip the relay 🚀 first.\n" }),
+                json!({ "path": "Private/Projects/plan.md", "content": "# Plan\nShip the relay 🚀 first.\n" }),
             )
             .await;
         relay
             .ok(
                 ALICE,
                 "create_note",
-                json!({ "path": "inbox.md", "content": "relay relay" }),
+                json!({ "path": "Private/inbox.md", "content": "relay relay" }),
             )
             .await;
 
         assert_eq!(
-            paths(&relay.ok(ALICE, "list_notes", json!({})).await),
-            ["inbox.md", "Projects"]
+            paths(
+                &relay
+                    .ok(ALICE, "list_notes", json!({ "path": "Private" }))
+                    .await
+            ),
+            ["Private/inbox.md", "Private/Projects"]
         );
         assert_eq!(
             paths(
                 &relay
-                    .ok(ALICE, "list_notes", json!({ "recursive": true }))
+                    .ok(
+                        ALICE,
+                        "list_notes",
+                        json!({ "path": "Private", "recursive": true })
+                    )
                     .await
             ),
-            ["inbox.md", "Projects", "Projects/plan.md"]
+            [
+                "Private/inbox.md",
+                "Private/Projects",
+                "Private/Projects/plan.md"
+            ]
         );
         assert_eq!(
             paths(
                 &relay
-                    .ok(ALICE, "list_notes", json!({ "path": "projects" }))
+                    .ok(ALICE, "list_notes", json!({ "path": "Private/projects" }))
                     .await
             ),
-            ["Projects/plan.md"]
+            ["Private/Projects/plan.md"]
         );
 
         // The edit lands after an emoji, where text positions are easy to
@@ -1458,32 +1497,36 @@ mod tests {
             .ok(
                 ALICE,
                 "edit_note",
-                json!({ "path": "Projects/plan.md", "old_text": "🚀 first", "new_text": "🚀 before Corliss" }),
+                json!({ "path": "Private/Projects/plan.md", "old_text": "🚀 first", "new_text": "🚀 before Corliss" }),
             )
             .await;
         relay
             .ok(
                 ALICE,
                 "append_note",
-                json!({ "path": "Projects/plan.md", "text": "Then the plugin." }),
+                json!({ "path": "Private/Projects/plan.md", "text": "Then the plugin." }),
             )
             .await;
         relay
             .ok(
                 ALICE,
                 "append_note",
-                json!({ "path": "inbox.md", "text": "second line" }),
+                json!({ "path": "Private/inbox.md", "text": "second line" }),
             )
             .await;
         assert_eq!(
             relay
-                .ok(ALICE, "read_note", json!({ "path": "Projects/plan.md" }))
+                .ok(
+                    ALICE,
+                    "read_note",
+                    json!({ "path": "Private/Projects/plan.md" })
+                )
                 .await,
             "# Plan\nShip the relay 🚀 before Corliss.\nThen the plugin."
         );
         assert_eq!(
             relay
-                .ok(ALICE, "read_note", json!({ "path": "/inbox.md" }))
+                .ok(ALICE, "read_note", json!({ "path": "/Private/inbox.md" }))
                 .await,
             "relay relay\nsecond line"
         );
@@ -1492,12 +1535,15 @@ mod tests {
         let found = relay
             .ok(ALICE, "search_notes", json!({ "query": "RELAY" }))
             .await;
-        assert_eq!(paths(&found), ["inbox.md", "Projects/plan.md"]);
+        assert_eq!(
+            paths(&found),
+            ["Private/inbox.md", "Private/Projects/plan.md"]
+        );
         assert!(found.contains("Ship the relay"));
         let found = relay
             .ok(ALICE, "search_notes", json!({ "query": "projects plugin" }))
             .await;
-        assert_eq!(paths(&found), ["Projects/plan.md"]);
+        assert_eq!(paths(&found), ["Private/Projects/plan.md"]);
         let found = relay
             .ok(
                 ALICE,
@@ -1516,38 +1562,53 @@ mod tests {
             .ok(
                 ALICE,
                 "create_note",
-                json!({ "path": "a.md", "content": "one two one" }),
+                json!({ "path": "Private/a.md", "content": "one two one" }),
             )
             .await;
 
         for (tool, arguments) in [
             // Already there, in any letter case.
-            ("create_note", json!({ "path": "A.md", "content": "" })),
-            ("create_note", json!({ "path": "notes.txt", "content": "" })),
             (
                 "create_note",
-                json!({ "path": ".hidden/a.md", "content": "" }),
+                json!({ "path": "Private/A.md", "content": "" }),
             ),
-            ("create_note", json!({ "path": "../a.md", "content": "" })),
+            (
+                "create_note",
+                json!({ "path": "Private/notes.txt", "content": "" }),
+            ),
+            (
+                "create_note",
+                json!({ "path": "Private/.hidden/a.md", "content": "" }),
+            ),
+            (
+                "create_note",
+                json!({ "path": "Private/../a.md", "content": "" }),
+            ),
             // A note is not a folder.
-            ("create_note", json!({ "path": "a.md/b.md", "content": "" })),
-            ("read_note", json!({ "path": "missing.md" })),
-            ("list_notes", json!({ "path": "missing" })),
+            (
+                "create_note",
+                json!({ "path": "Private/a.md/b.md", "content": "" }),
+            ),
+            ("read_note", json!({ "path": "Private/missing.md" })),
+            ("list_notes", json!({ "path": "Private/missing" })),
             (
                 "edit_note",
-                json!({ "path": "a.md", "old_text": "three", "new_text": "3" }),
+                json!({ "path": "Private/a.md", "old_text": "three", "new_text": "3" }),
             ),
             // Two matches and no replace_all.
             (
                 "edit_note",
-                json!({ "path": "a.md", "old_text": "one", "new_text": "1" }),
+                json!({ "path": "Private/a.md", "old_text": "one", "new_text": "1" }),
             ),
             (
                 "edit_note",
-                json!({ "path": "a.md", "old_text": "", "new_text": "x" }),
+                json!({ "path": "Private/a.md", "old_text": "", "new_text": "x" }),
             ),
-            ("append_note", json!({ "path": "missing.md", "text": "x" })),
-            ("read_note", json!({ "workspace": "Other", "path": "a.md" })),
+            (
+                "append_note",
+                json!({ "path": "Private/missing.md", "text": "x" }),
+            ),
+            ("read_note", json!({ "path": "Other/a.md" })),
             ("search_notes", json!({ "query": "  " })),
         ] {
             relay.refused(ALICE, tool, arguments).await;
@@ -1555,7 +1616,7 @@ mod tests {
         // None of that changed the note.
         assert_eq!(
             relay
-                .ok(ALICE, "read_note", json!({ "path": "a.md" }))
+                .ok(ALICE, "read_note", json!({ "path": "Private/a.md" }))
                 .await,
             "one two one"
         );
@@ -1564,12 +1625,12 @@ mod tests {
             .ok(
                 ALICE,
                 "edit_note",
-                json!({ "path": "a.md", "old_text": "one", "new_text": "1", "replace_all": true }),
+                json!({ "path": "Private/a.md", "old_text": "one", "new_text": "1", "replace_all": true }),
             )
             .await;
         assert_eq!(
             relay
-                .ok(ALICE, "read_note", json!({ "path": "a.md" }))
+                .ok(ALICE, "read_note", json!({ "path": "Private/a.md" }))
                 .await,
             "1 two 1"
         );
@@ -1579,7 +1640,7 @@ mod tests {
         group_workspace(&relay.base, ALICE, "7", "Garden").await;
         let in_7 = ["7"];
         let (is_error, text) = relay
-            .call_in(ALICE, &in_7, "read_note", json!({ "path": "a.md" }))
+            .call_in(ALICE, &in_7, "read_note", json!({ "path": "Private/a.md" }))
             .await;
         assert!(!is_error, "{text}");
         assert_eq!(text, "1 two 1");
@@ -1588,7 +1649,7 @@ mod tests {
                 ALICE,
                 &in_7,
                 "read_note",
-                json!({ "workspace": "Garden", "path": "a.md" }),
+                json!({ "path": "Workspaces/Garden/a.md" }),
             )
             .await;
         assert!(is_error);
@@ -1603,19 +1664,23 @@ mod tests {
             .ok(
                 ALICE,
                 "create_note",
-                json!({ "path": "secret.md", "content": "alice only" }),
+                json!({ "path": "Private/secret.md", "content": "alice only" }),
             )
             .await;
 
         // Same workspace name, his own workspace: hers is not in it.
         assert!(paths(
             &relay
-                .ok(BOB, "list_notes", json!({ "recursive": true }))
+                .ok(
+                    BOB,
+                    "list_notes",
+                    json!({ "path": "Private", "recursive": true })
+                )
                 .await
         )
         .is_empty());
         relay
-            .refused(BOB, "read_note", json!({ "path": "secret.md" }))
+            .refused(BOB, "read_note", json!({ "path": "Private/secret.md" }))
             .await;
         assert!(paths(
             &relay
@@ -1649,15 +1714,20 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(paths(&relay.ok(BOB, "list_notes", json!({})).await).is_empty());
+        assert!(paths(
+            &relay
+                .ok(BOB, "list_notes", json!({ "path": "Private" }))
+                .await
+        )
+        .is_empty());
         relay
-            .refused(BOB, "read_note", json!({ "path": "stolen.md" }))
+            .refused(BOB, "read_note", json!({ "path": "Private/stolen.md" }))
             .await;
         relay
             .refused(
                 BOB,
                 "append_note",
-                json!({ "path": "stolen.md", "text": "mine now" }),
+                json!({ "path": "Private/stolen.md", "text": "mine now" }),
             )
             .await;
         assert!(paths(
@@ -1668,7 +1738,7 @@ mod tests {
         .is_empty());
         assert_eq!(
             relay
-                .ok(ALICE, "read_note", json!({ "path": "secret.md" }))
+                .ok(ALICE, "read_note", json!({ "path": "Private/secret.md" }))
                 .await,
             "alice only"
         );
@@ -1695,7 +1765,7 @@ mod tests {
             .ok(
                 ALICE,
                 "create_note",
-                json!({ "path": "today.md", "content": "from Claude" }),
+                json!({ "path": "Private/today.md", "content": "from Claude" }),
             )
             .await;
 
@@ -1740,7 +1810,7 @@ mod tests {
 
         for _ in 0..100 {
             let text = relay
-                .ok(ALICE, "read_note", json!({ "path": "today.md" }))
+                .ok(ALICE, "read_note", json!({ "path": "Private/today.md" }))
                 .await;
             if text == "from Claude, and from the phone" {
                 return;

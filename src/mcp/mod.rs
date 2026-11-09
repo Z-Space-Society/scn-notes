@@ -154,7 +154,7 @@ pub(crate) mod tests {
             authz,
             caller: &caller,
         };
-        let (root, _) = notes.workspace(None).await.unwrap();
+        let root = notes.locate("Private").await.unwrap().root;
         notes
             .list(&root, "", true)
             .await

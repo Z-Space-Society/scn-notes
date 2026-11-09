@@ -266,17 +266,18 @@ in no workspace.
 ### MCP tools
 
 Every tool acts as the member the token names, in the groups it names. A
-tool's `workspace` argument is `Private` or `Workspaces/<name>`, as
-`list_workspaces` gives it, or a shared workspace's bare name. Left out, it
-is the caller's Private workspace, which every member has. Two workspaces
-sharing a name are refused rather than guessed between.
+path starts with its workspace, the same path the Obsidian plugin puts the
+file at: `Private/...` for the caller's own, `Workspaces/<name>/...` for a
+shared one, in any letter case. Every path a tool returns is written the same
+way. A path that starts with neither is refused with a pointer to
+`list_notes`, and two shared workspaces with one name are refused rather than
+guessed between.
 
 | Tool | Does |
 | --- | --- |
-| `list_workspaces` | The caller's Private workspace and shared workspaces |
-| `list_notes` | Notes and folders in a workspace or one of its folders |
+| `list_notes` | With no path, the caller's workspaces (`Private` and each `Workspaces/<name>`). With `Workspaces`, the shared ones. With a workspace or folder, what is in it. |
 | `read_note` | A note's markdown |
-| `search_notes` | Notes containing every word of a query |
+| `search_notes` | Notes containing every word of a query, across every workspace, or in the workspace or folder given as `path` |
 | `create_note` | A new note at a path, with any folders on the way |
 | `edit_note` | Replace one piece of a note's text with another |
 | `append_note` | Add text to the end of a note |
