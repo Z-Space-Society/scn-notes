@@ -18,7 +18,6 @@ use super::notes::{NoteError, Notes};
 use super::search;
 use crate::auth::Caller;
 use crate::authz::Authz;
-use crate::authz::{PRIVATE, WORKSPACES};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 50;
@@ -31,10 +30,10 @@ pub struct NotesServer {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ListNotes {
-    /// Workspace, as list_workspaces gives it: "Private" or "Workspaces/<name>".
-    /// A shared workspace's bare name works too. Left out, your Private workspace.
-    workspace: Option<String>,
-    /// Folder to list, such as "Projects/2026". Leave out for the top level.
+    /// What to list. Leave out for your workspaces: "Private", yours alone,
+    /// and "Workspaces/<name>" for each shared one. "Workspaces" lists the
+    /// shared ones; a workspace or a folder in one, such as
+    /// "Private/Projects", lists what is in it.
     path: Option<String>,
     /// Also list everything inside the folders found. Defaults to false.
     recursive: Option<bool>,
@@ -42,32 +41,28 @@ pub struct ListNotes {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ReadNote {
-    /// Workspace, as list_workspaces gives it: "Private" or "Workspaces/<name>".
-    /// A shared workspace's bare name works too. Left out, your Private workspace.
-    workspace: Option<String>,
-    /// Path of the note, such as "Projects/plan.md".
+    /// Path of the note, starting with its workspace: "Private/plan.md" for
+    /// your own, "Workspaces/<name>/plan.md" for a shared one.
     path: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct SearchNotes {
-    /// Workspace, as list_workspaces gives it: "Private" or "Workspaces/<name>".
-    /// A shared workspace's bare name works too. Left out, your Private workspace.
-    workspace: Option<String>,
     /// Words to look for. A note matches when it contains all of them, in its
     /// text or its path, in any letter case.
     query: String,
+    /// Where to look: a workspace or a folder in one, such as "Private" or
+    /// "Workspaces/Garden/Plans". Leave out to search every workspace you have.
+    path: Option<String>,
     /// The most notes to return. Defaults to 20, at most 50.
     limit: Option<usize>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct CreateNote {
-    /// Workspace, as list_workspaces gives it: "Private" or "Workspaces/<name>".
-    /// A shared workspace's bare name works too. Left out, your Private workspace.
-    workspace: Option<String>,
-    /// Path for the new note, ending in ".md", such as "Projects/plan.md".
-    /// Folders on the way that do not exist are created.
+    /// Path for the new note, starting with its workspace and ending in ".md":
+    /// "Private/Projects/plan.md", or "Workspaces/<name>/plan.md" to share it
+    /// with that workspace. Folders on the way that do not exist are created.
     path: String,
     /// The note's markdown.
     content: String,
@@ -75,10 +70,8 @@ pub struct CreateNote {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct EditNote {
-    /// Workspace, as list_workspaces gives it: "Private" or "Workspaces/<name>".
-    /// A shared workspace's bare name works too. Left out, your Private workspace.
-    workspace: Option<String>,
-    /// Path of the note, such as "Projects/plan.md".
+    /// Path of the note, starting with its workspace: "Private/plan.md" for
+    /// your own, "Workspaces/<name>/plan.md" for a shared one.
     path: String,
     /// The exact text to replace. It must appear in the note, and only once
     /// unless replace_all is set, so include enough around it to be unique.
@@ -91,10 +84,8 @@ pub struct EditNote {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct AppendNote {
-    /// Workspace, as list_workspaces gives it: "Private" or "Workspaces/<name>".
-    /// A shared workspace's bare name works too. Left out, your Private workspace.
-    workspace: Option<String>,
-    /// Path of the note, such as "Projects/plan.md".
+    /// Path of the note, starting with its workspace: "Private/plan.md" for
+    /// your own, "Workspaces/<name>/plan.md" for a shared one.
     path: String,
     /// The text to add. It starts on a new line.
     text: String,
@@ -143,38 +134,7 @@ impl NotesServer {
     }
 
     #[tool(
-        description = "List your workspaces: your Private workspace, which is yours alone and which tools use when no workspace is named, and the shared workspaces you are in, whose notes every member of them can read and change. Each entry's \"workspace\" value is how the other tools name it.",
-        annotations(title = "List workspaces", read_only_hint = true)
-    )]
-    async fn list_workspaces(
-        &self,
-        Extension(parts): Extension<Parts>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let caller = caller(&parts)?;
-        match self.authz.list_workspaces(&caller).await {
-            Ok(workspaces) => {
-                let group = |shared: bool| {
-                    workspaces
-                        .iter()
-                        .filter(|workspace| workspace.group_id.is_some() == shared)
-                        .map(|workspace| {
-                            json!({
-                                "workspace": workspace.path,
-                                "name": workspace.name,
-                                "created_at": workspace.created_at,
-                                "last_change_at": workspace.last_change_at,
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                };
-                listed(json!({ PRIVATE: group(false), WORKSPACES: group(true) }))
-            }
-            Err(e) => failed(NoteError::Internal(e)),
-        }
-    }
-
-    #[tool(
-        description = "List the notes and folders in a workspace, or in one folder of it.",
+        description = "List your workspaces, or the notes and folders in one. With no path, lists your workspaces: Private, which is yours alone, and Workspaces/<name> for each one you share with others. Every path these tools take and return starts with its workspace.",
         annotations(title = "List notes", read_only_hint = true)
     )]
     async fn list_notes(
@@ -187,23 +147,14 @@ impl NotesServer {
             authz: &self.authz,
             caller: &caller,
         };
-        let found = async {
-            let (root, _) = notes.workspace(args.workspace.as_deref()).await?;
-            notes
-                .list(
-                    &root,
-                    args.path.as_deref().unwrap_or_default(),
-                    args.recursive.unwrap_or(false),
-                )
-                .await
-        };
+        let found = notes.list_anywhere(
+            args.path.as_deref().unwrap_or_default(),
+            args.recursive.unwrap_or(false),
+        );
         match found.await {
             Ok(found) => listed(json!(found
                 .iter()
-                .map(|item| json!({
-                    "path": item.path,
-                    "type": if item.is_folder { "folder" } else { "note" },
-                }))
+                .map(|item| json!({ "path": item.path, "type": item.kind.as_str() }))
                 .collect::<Vec<_>>())),
             Err(e) => failed(e),
         }
@@ -224,8 +175,8 @@ impl NotesServer {
             caller: &caller,
         };
         let text = async {
-            let (root, _) = notes.workspace(args.workspace.as_deref()).await?;
-            notes.read(&root, &args.path).await
+            let at = notes.locate(&args.path).await?;
+            notes.read(&at.root, &at.rest).await
         };
         match text.await {
             Ok(text) => said(text),
@@ -234,8 +185,8 @@ impl NotesServer {
     }
 
     #[tool(
-        description = "Search the text of every note in a workspace. Returns the matching notes' \
-                       paths with the lines that matched.",
+        description = "Search the text of your notes, in every workspace or in one workspace or \
+                       folder. Returns the matching notes' paths with the lines that matched.",
         annotations(title = "Search notes", read_only_hint = true)
     )]
     async fn search_notes(
@@ -253,8 +204,10 @@ impl NotesServer {
             .unwrap_or(DEFAULT_SEARCH_LIMIT)
             .clamp(1, MAX_SEARCH_LIMIT);
         let hits = async {
-            let (root, _) = notes.workspace(args.workspace.as_deref()).await?;
-            search::search(&notes, &root, &args.query, limit).await
+            let scopes = notes
+                .scopes(args.path.as_deref().unwrap_or_default())
+                .await?;
+            search::search(&notes, &scopes, &args.query, limit).await
         };
         match hits.await {
             Ok(hits) => listed(json!(hits
@@ -288,12 +241,12 @@ impl NotesServer {
             caller: &caller,
         };
         let created = async {
-            let (root, workspace) = notes.workspace(args.workspace.as_deref()).await?;
-            let path = notes.create(&root, &args.path, &args.content).await?;
-            Ok((workspace, path))
+            let at = notes.locate(&args.path).await?;
+            let path = notes.create(&at.root, &at.rest, &args.content).await?;
+            Ok(at.full(&path))
         };
         match created.await {
-            Ok((workspace, path)) => said(format!("Created {path} in {workspace}.")),
+            Ok(path) => said(format!("Created {path}.")),
             Err(e) => failed(e),
         }
     }
@@ -315,11 +268,11 @@ impl NotesServer {
         };
         let path = args.path.clone();
         let edited = async {
-            let (root, _) = notes.workspace(args.workspace.as_deref()).await?;
+            let at = notes.locate(&args.path).await?;
             notes
                 .edit(
-                    &root,
-                    &args.path,
+                    &at.root,
+                    &at.rest,
                     args.old_text,
                     args.new_text,
                     args.replace_all.unwrap_or(false),
@@ -353,8 +306,8 @@ impl NotesServer {
         };
         let path = args.path.clone();
         let appended = async {
-            let (root, _) = notes.workspace(args.workspace.as_deref()).await?;
-            notes.append(&root, &args.path, args.text).await
+            let at = notes.locate(&args.path).await?;
+            notes.append(&at.root, &at.rest, args.text).await
         };
         match appended.await {
             Ok(()) => said(format!("Appended to {path}.")),
@@ -370,8 +323,9 @@ impl ServerHandler for NotesServer {
             .with_server_info(Implementation::new("scn-notes", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Your Obsidian notes on the Shared Computer Network. Notes are markdown files \
-                 addressed by path inside a workspace. Changes made here appear in Obsidian on \
-                 your devices, and changes made there appear here.",
+                 addressed by a path that starts with their workspace: Private/... for yours \
+                 alone, Workspaces/<name>/... for one you share. Changes made here appear in \
+                 Obsidian on your devices, and changes made there appear here.",
             )
     }
 }
