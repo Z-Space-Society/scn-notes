@@ -13,7 +13,7 @@
 //! - `sync`: the actor's first new change arrived on that member's connection.
 //! - `mcp`: the actor the relay writes under for that member's MCP edits.
 //! - `creator`, `private`: the one-off backfill of history stored before the
-//!   map existed, from a document's creator and from private vaults.
+//!   map existed, from a document's creator and from private workspaces.
 //!
 //! The table is loaded into memory at startup and written through, like
 //! `doc_creators`, so a frame whose actors are already known costs no query.
@@ -295,7 +295,7 @@ impl Authz {
     }
 
     /// Run the backfill in the background, once the index has walked every
-    /// vault. Started by the service, not by the `file-unfiled` command.
+    /// workspace. Started by the service, not by the `file-unfiled` command.
     pub fn start_actor_backfill(&self) {
         let authz = self.clone();
         tokio::spawn(async move {
@@ -316,9 +316,9 @@ impl Authz {
     ///
     /// 1. **Creator.** A document's first change (no dependencies) was made by
     ///    whoever sent it first, its `doc_creators` member.
-    /// 2. **Private.** Every other actor in a private vault's document is its
+    /// 2. **Private.** Every other actor in a private workspace's document is its
     ///    owner's, since nobody else can open it. A note moved in from a
-    ///    workspace can carry another member's old edits; this rule would give
+    ///    group can carry another member's old edits; this rule would give
     ///    those to the owner, which the README states.
     ///
     /// An actor one rule would give to two members is left unmapped.
@@ -476,7 +476,7 @@ mod tests {
     use samod::{DocHandle, Repo};
     use sqlx::PgPool;
 
-    use crate::authz::tests::{did, eventually, link, member_of, open, vault, workspace_vault};
+    use crate::authz::tests::{did, eventually, group_workspace, link, member_of, open, workspace};
     use crate::filter::{Filter, Inbound};
     use crate::mcp::notes::Notes;
     use crate::wire::tests::frame_with;
@@ -555,10 +555,10 @@ mod tests {
             .unwrap()
     }
 
-    /// A note in workspace 7's vault, made by Alice, that Alice and Bob may
+    /// A note in group 7's workspace, made by Alice, that Alice and Bob may
     /// both open and the relay has stored.
     async fn shared_note(authz: &Authz, repo: &Repo) -> DocHandle {
-        let (root, root_doc) = workspace_vault(authz, repo, "7").await;
+        let (root, root_doc) = group_workspace(authz, repo, "7").await;
         let mut first = Automerge::new();
         edit(&mut first, "title");
         let handle = repo.create(first).await.unwrap();
@@ -567,8 +567,8 @@ mod tests {
             .await
             .unwrap();
         link(&root_doc, "plan.md", "md", handle.document_id()).await;
-        eventually("the note is in the workspace's vault", || {
-            authz.vault_of(handle.document_id()) == Some(root.clone())
+        eventually("the note is in the group's workspace", || {
+            authz.workspace_of(handle.document_id()) == Some(root.clone())
         })
         .await;
         until_stored(authz, handle.document_id(), 1).await;
@@ -682,7 +682,7 @@ mod tests {
             authz: &authz,
             caller: &caller,
         };
-        let (root, _) = notes.vault(None).await.unwrap();
+        let (root, _) = notes.workspace(None).await.unwrap();
         notes.create(&root, "Plans/a.md", "one").await.unwrap();
         notes
             .edit(&root, "Plans/a.md", "one".into(), "two".into(), false)
@@ -716,9 +716,9 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn the_backfill_maps_creators_and_private_vaults_once(pool: PgPool) {
+    async fn the_backfill_maps_creators_and_private_workspaces_once(pool: PgPool) {
         let (authz, repo) = open(&pool).await;
-        let (root, root_doc) = vault(&authz, &repo, &did("alice")).await;
+        let (root, root_doc) = workspace(&authz, &repo, &did("alice")).await;
         let (made, later, mapped) = (ActorId::random(), ActorId::random(), ActorId::random());
 
         // A note Alice made, edited in two later sessions, one of which the
@@ -737,8 +737,8 @@ mod tests {
         }
         authz.map_actor(&mapped, &did("carol"), SYNC).await.unwrap();
         link(&root_doc, "a.md", "md", handle.document_id()).await;
-        eventually("the note is in the vault", || {
-            authz.vault_of(handle.document_id()) == Some(root.clone())
+        eventually("the note is in the workspace", || {
+            authz.workspace_of(handle.document_id()) == Some(root.clone())
         })
         .await;
         until_stored(&authz, handle.document_id(), 3).await;

@@ -31,9 +31,9 @@ pub struct NotesServer {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ListNotes {
-    /// Vault, as list_vaults gives it: "Private" or "Workspaces/<name>".
-    /// A workspace's bare name works too. Left out, your private vault.
-    vault: Option<String>,
+    /// Workspace, as list_workspaces gives it: "Private" or "Workspaces/<name>".
+    /// A shared workspace's bare name works too. Left out, your Private workspace.
+    workspace: Option<String>,
     /// Folder to list, such as "Projects/2026". Leave out for the top level.
     path: Option<String>,
     /// Also list everything inside the folders found. Defaults to false.
@@ -42,18 +42,18 @@ pub struct ListNotes {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ReadNote {
-    /// Vault, as list_vaults gives it: "Private" or "Workspaces/<name>".
-    /// A workspace's bare name works too. Left out, your private vault.
-    vault: Option<String>,
+    /// Workspace, as list_workspaces gives it: "Private" or "Workspaces/<name>".
+    /// A shared workspace's bare name works too. Left out, your Private workspace.
+    workspace: Option<String>,
     /// Path of the note, such as "Projects/plan.md".
     path: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct SearchNotes {
-    /// Vault, as list_vaults gives it: "Private" or "Workspaces/<name>".
-    /// A workspace's bare name works too. Left out, your private vault.
-    vault: Option<String>,
+    /// Workspace, as list_workspaces gives it: "Private" or "Workspaces/<name>".
+    /// A shared workspace's bare name works too. Left out, your Private workspace.
+    workspace: Option<String>,
     /// Words to look for. A note matches when it contains all of them, in its
     /// text or its path, in any letter case.
     query: String,
@@ -63,9 +63,9 @@ pub struct SearchNotes {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct CreateNote {
-    /// Vault, as list_vaults gives it: "Private" or "Workspaces/<name>".
-    /// A workspace's bare name works too. Left out, your private vault.
-    vault: Option<String>,
+    /// Workspace, as list_workspaces gives it: "Private" or "Workspaces/<name>".
+    /// A shared workspace's bare name works too. Left out, your Private workspace.
+    workspace: Option<String>,
     /// Path for the new note, ending in ".md", such as "Projects/plan.md".
     /// Folders on the way that do not exist are created.
     path: String,
@@ -75,9 +75,9 @@ pub struct CreateNote {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct EditNote {
-    /// Vault, as list_vaults gives it: "Private" or "Workspaces/<name>".
-    /// A workspace's bare name works too. Left out, your private vault.
-    vault: Option<String>,
+    /// Workspace, as list_workspaces gives it: "Private" or "Workspaces/<name>".
+    /// A shared workspace's bare name works too. Left out, your Private workspace.
+    workspace: Option<String>,
     /// Path of the note, such as "Projects/plan.md".
     path: String,
     /// The exact text to replace. It must appear in the note, and only once
@@ -91,9 +91,9 @@ pub struct EditNote {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct AppendNote {
-    /// Vault, as list_vaults gives it: "Private" or "Workspaces/<name>".
-    /// A workspace's bare name works too. Left out, your private vault.
-    vault: Option<String>,
+    /// Workspace, as list_workspaces gives it: "Private" or "Workspaces/<name>".
+    /// A shared workspace's bare name works too. Left out, your Private workspace.
+    workspace: Option<String>,
     /// Path of the note, such as "Projects/plan.md".
     path: String,
     /// The text to add. It starts on a new line.
@@ -143,26 +143,26 @@ impl NotesServer {
     }
 
     #[tool(
-        description = "List your vaults, in two groups. Your private vault is yours alone; tools use it when no vault is named. Workspaces vaults each belong to a workspace you are in, and every member of it can read and change its notes. Each vault's \"vault\" value is how the other tools name it.",
-        annotations(title = "List vaults", read_only_hint = true)
+        description = "List your workspaces: your Private workspace, which is yours alone and which tools use when no workspace is named, and the shared workspaces you are in, whose notes every member of them can read and change. Each entry's \"workspace\" value is how the other tools name it.",
+        annotations(title = "List workspaces", read_only_hint = true)
     )]
-    async fn list_vaults(
+    async fn list_workspaces(
         &self,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, ErrorData> {
         let caller = caller(&parts)?;
-        match self.authz.list_vaults(&caller).await {
-            Ok(vaults) => {
+        match self.authz.list_workspaces(&caller).await {
+            Ok(workspaces) => {
                 let group = |shared: bool| {
-                    vaults
+                    workspaces
                         .iter()
-                        .filter(|vault| vault.workspace.is_some() == shared)
-                        .map(|vault| {
+                        .filter(|workspace| workspace.group_id.is_some() == shared)
+                        .map(|workspace| {
                             json!({
-                                "vault": vault.path,
-                                "name": vault.name,
-                                "created_at": vault.created_at,
-                                "last_change_at": vault.last_change_at,
+                                "workspace": workspace.path,
+                                "name": workspace.name,
+                                "created_at": workspace.created_at,
+                                "last_change_at": workspace.last_change_at,
                             })
                         })
                         .collect::<Vec<_>>()
@@ -174,7 +174,7 @@ impl NotesServer {
     }
 
     #[tool(
-        description = "List the notes and folders in a vault, or in one folder of it.",
+        description = "List the notes and folders in a workspace, or in one folder of it.",
         annotations(title = "List notes", read_only_hint = true)
     )]
     async fn list_notes(
@@ -188,7 +188,7 @@ impl NotesServer {
             caller: &caller,
         };
         let found = async {
-            let (root, _) = notes.vault(args.vault.as_deref()).await?;
+            let (root, _) = notes.workspace(args.workspace.as_deref()).await?;
             notes
                 .list(
                     &root,
@@ -224,7 +224,7 @@ impl NotesServer {
             caller: &caller,
         };
         let text = async {
-            let (root, _) = notes.vault(args.vault.as_deref()).await?;
+            let (root, _) = notes.workspace(args.workspace.as_deref()).await?;
             notes.read(&root, &args.path).await
         };
         match text.await {
@@ -234,7 +234,7 @@ impl NotesServer {
     }
 
     #[tool(
-        description = "Search the text of every note in a vault. Returns the matching notes' \
+        description = "Search the text of every note in a workspace. Returns the matching notes' \
                        paths with the lines that matched.",
         annotations(title = "Search notes", read_only_hint = true)
     )]
@@ -253,7 +253,7 @@ impl NotesServer {
             .unwrap_or(DEFAULT_SEARCH_LIMIT)
             .clamp(1, MAX_SEARCH_LIMIT);
         let hits = async {
-            let (root, _) = notes.vault(args.vault.as_deref()).await?;
+            let (root, _) = notes.workspace(args.workspace.as_deref()).await?;
             search::search(&notes, &root, &args.query, limit).await
         };
         match hits.await {
@@ -288,12 +288,12 @@ impl NotesServer {
             caller: &caller,
         };
         let created = async {
-            let (root, vault) = notes.vault(args.vault.as_deref()).await?;
+            let (root, workspace) = notes.workspace(args.workspace.as_deref()).await?;
             let path = notes.create(&root, &args.path, &args.content).await?;
-            Ok((vault, path))
+            Ok((workspace, path))
         };
         match created.await {
-            Ok((vault, path)) => said(format!("Created {path} in {vault}.")),
+            Ok((workspace, path)) => said(format!("Created {path} in {workspace}.")),
             Err(e) => failed(e),
         }
     }
@@ -315,7 +315,7 @@ impl NotesServer {
         };
         let path = args.path.clone();
         let edited = async {
-            let (root, _) = notes.vault(args.vault.as_deref()).await?;
+            let (root, _) = notes.workspace(args.workspace.as_deref()).await?;
             notes
                 .edit(
                     &root,
@@ -353,7 +353,7 @@ impl NotesServer {
         };
         let path = args.path.clone();
         let appended = async {
-            let (root, _) = notes.vault(args.vault.as_deref()).await?;
+            let (root, _) = notes.workspace(args.workspace.as_deref()).await?;
             notes.append(&root, &args.path, args.text).await
         };
         match appended.await {
@@ -367,13 +367,10 @@ impl NotesServer {
 impl ServerHandler for NotesServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "scn-notes",
-                env!("CARGO_PKG_VERSION"),
-            ))
+            .with_server_info(Implementation::new("scn-notes", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Your Obsidian notes on the Shared Computer Network. Notes are markdown files \
-                 addressed by path inside a vault. Changes made here appear in Obsidian on \
+                 addressed by path inside a workspace. Changes made here appear in Obsidian on \
                  your devices, and changes made there appear here.",
             )
     }

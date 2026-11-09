@@ -1,15 +1,15 @@
-//! Which documents each vault reaches.
+//! Which documents each workspace reaches.
 //!
-//! A vault's root is a folder document, a folder lists entries, and an entry
+//! A workspace's root is a folder document, a folder lists entries, and an entry
 //! points at a note or another folder. Walking from the root gives the set of
-//! documents in the vault. That set is what paths, tools and search work from.
+//! documents in the workspace. That set is what paths, tools and search work from.
 //!
 //! It is derived and rebuildable: never authoritative, never persisted. The
 //! authority is the folder documents themselves plus `doc_creators`.
 //!
-//! **Admission rule.** A document joins a vault's set only if the vault's
-//! holder admits its creator ([`Holder::admits`]): for a member's vault, the
-//! member created it; for a workspace's, someone in the workspace did. Without
+//! **Admission rule.** A document joins a workspace's set only if the workspace's
+//! holder admits its creator ([`Holder::admits`]): for a member's workspace, the
+//! member created it; for a group's, someone in the group did. Without
 //! that, a member could reach someone else's document by writing its URL into
 //! their own folder.
 
@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 
 use crate::authz::{Authz, Holder};
 
-/// The shortest gap between two rebuilds of one vault. A first import changes
+/// The shortest gap between two rebuilds of one workspace. A first import changes
 /// folder documents thousands of times.
 const REBUILD_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -39,7 +39,7 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 /// How many rebuilds in a row may go looking for a folder that will not load.
 const MAX_LOAD_RETRIES: u8 = 5;
 
-/// How often changed vaults have `last_change_at` written. Never per edit.
+/// How often changed workspaces have `last_change_at` written. Never per edit.
 const LAST_CHANGE_FLUSH: Duration = Duration::from_secs(60);
 
 /// The entry type that marks a folder. Every other type is a file extension.
@@ -49,25 +49,25 @@ pub(crate) const NOTE: &str = "md";
 
 #[derive(Default)]
 pub(crate) struct Index {
-    vaults: HashMap<DocumentId, VaultReach>,
-    /// Every reachable document, and the root of the vault that reaches it.
+    workspaces: HashMap<DocumentId, WorkspaceReach>,
+    /// Every reachable document, and the root of the workspace that reaches it.
     doc_to_root: HashMap<DocumentId, DocumentId>,
 }
 
-struct VaultReach {
+struct WorkspaceReach {
     holder: Holder,
     docs: HashSet<DocumentId>,
     /// Linked from a folder, creator not yet known. A folder change can arrive
     /// before the linked note's first frame.
     pending: HashSet<DocumentId>,
-    /// Asks the vault's task for a rebuild. Holds at most one request, which is
+    /// Asks the workspace's task for a rebuild. Holds at most one request, which is
     /// what collapses a burst of folder changes into one walk.
     wake: Arc<Notify>,
     /// One task per reachable document, listening for changes.
     watchers: HashMap<DocumentId, JoinHandle<()>>,
     load_retries: u8,
     /// How many notes the last walk found. `None` until the first walk, when
-    /// `docs` holds only the root and would understate the vault.
+    /// `docs` holds only the root and would understate the workspace.
     notes: Option<usize>,
     last_change: Option<DateTime<Utc>>,
     /// `last_change` is newer than the table.
@@ -75,53 +75,55 @@ struct VaultReach {
 }
 
 impl Index {
-    /// Who holds the vault a document is in, if any.
+    /// Who holds the workspace a document is in, if any.
     pub(crate) fn holder_of(&self, doc: &DocumentId) -> Option<&Holder> {
         let root = self.doc_to_root.get(doc)?;
-        self.vaults.get(root).map(|vault| &vault.holder)
+        self.workspaces.get(root).map(|workspace| &workspace.holder)
     }
 
-    /// The root of the vault a document is in, if any.
-    pub(crate) fn vault_of(&self, doc: &DocumentId) -> Option<&DocumentId> {
+    /// The root of the workspace a document is in, if any.
+    pub(crate) fn workspace_of(&self, doc: &DocumentId) -> Option<&DocumentId> {
         self.doc_to_root.get(doc)
     }
 
-    /// Has every vault been walked at least once? Until then a document can
-    /// look as if no vault reaches it only because its vault's walk is still
+    /// Has every workspace been walked at least once? Until then a document can
+    /// look as if no workspace reaches it only because its workspace's walk is still
     /// to come.
     pub(crate) fn all_walked(&self) -> bool {
-        self.vaults.values().all(|vault| vault.notes.is_some())
+        self.workspaces
+            .values()
+            .all(|workspace| workspace.notes.is_some())
     }
 
-    /// Put a vault back in its state before its first walk.
+    /// Put a workspace back in its state before its first walk.
     #[cfg(test)]
     pub(crate) fn forget_walk(&mut self, root: &DocumentId) {
-        if let Some(vault) = self.vaults.get_mut(root) {
-            vault.notes = None;
+        if let Some(workspace) = self.workspaces.get_mut(root) {
+            workspace.notes = None;
         }
     }
 
     pub(crate) fn last_change(&self, root: &DocumentId) -> Option<DateTime<Utc>> {
-        self.vaults.get(root)?.last_change
+        self.workspaces.get(root)?.last_change
     }
 
     pub(crate) fn note_count(&self, root: &DocumentId) -> Option<usize> {
-        self.vaults.get(root)?.notes
+        self.workspaces.get(root)?.notes
     }
 
-    /// Every document in a vault, once it has been walked.
+    /// Every document in a workspace, once it has been walked.
     pub(crate) fn docs_of(&self, root: &DocumentId) -> Option<Vec<DocumentId>> {
-        let vault = self.vaults.get(root)?;
-        vault.notes?;
-        Some(vault.docs.iter().cloned().collect())
+        let workspace = self.workspaces.get(root)?;
+        workspace.notes?;
+        Some(workspace.docs.iter().cloned().collect())
     }
 
-    /// A creator has just been recorded: rebuild any vault that was waiting to
+    /// A creator has just been recorded: rebuild any workspace that was waiting to
     /// learn it.
     pub(crate) fn wake_pending(&self, doc: &DocumentId) {
-        for vault in self.vaults.values() {
-            if vault.pending.contains(doc) {
-                vault.wake.notify_one();
+        for workspace in self.workspaces.values() {
+            if workspace.pending.contains(doc) {
+                workspace.wake.notify_one();
             }
         }
     }
@@ -226,9 +228,9 @@ pub(crate) fn add_entry(doc: &mut Automerge, entry: &Entry) -> Result<(), Autome
 }
 
 impl Authz {
-    /// Begin indexing a vault: now, and again whenever one of its folders
+    /// Begin indexing a workspace: now, and again whenever one of its folders
     /// changes, at most once per [`REBUILD_INTERVAL`].
-    pub(crate) fn start_vault(
+    pub(crate) fn start_workspace(
         &self,
         root: DocumentId,
         holder: Holder,
@@ -237,11 +239,11 @@ impl Authz {
         let wake = Arc::new(Notify::new());
         {
             let mut index = self.0.reach.write().unwrap();
-            // The root is in its own vault from the start, before any walk.
+            // The root is in its own workspace from the start, before any walk.
             index.doc_to_root.insert(root.clone(), root.clone());
-            index.vaults.insert(
+            index.workspaces.insert(
                 root.clone(),
-                VaultReach {
+                WorkspaceReach {
                     holder,
                     docs: HashSet::from([root.clone()]),
                     pending: HashSet::new(),
@@ -273,16 +275,16 @@ impl Authz {
         }
     }
 
-    /// Walk the vault's folders from its root and replace its reachable set.
+    /// Walk the workspace's folders from its root and replace its reachable set.
     async fn rebuild(&self, root: &DocumentId) {
         let Some((holder, wake)) = self
             .0
             .reach
             .read()
             .unwrap()
-            .vaults
+            .workspaces
             .get(root)
-            .map(|vault| (vault.holder.clone(), Arc::clone(&vault.wake)))
+            .map(|workspace| (workspace.holder.clone(), Arc::clone(&workspace.wake)))
         else {
             return;
         };
@@ -328,8 +330,8 @@ impl Authz {
                         }
                     }
                     Some(creator) => tracing::warn!(
-                        vault = %root, doc = %id, %holder, creator = %creator.did,
-                        "ignoring a link to a document its vault does not admit"
+                        workspace = %root, doc = %id, %holder, creator = %creator.did,
+                        "ignoring a link to a document its workspace does not admit"
                     ),
                     None => {
                         pending.insert(id);
@@ -340,11 +342,11 @@ impl Authz {
 
         let mut guard = self.0.reach.write().unwrap();
         let index = &mut *guard;
-        let Some(vault) = index.vaults.get_mut(root) else {
+        let Some(workspace) = index.workspaces.get_mut(root) else {
             return;
         };
 
-        for gone in vault.docs.difference(&docs) {
+        for gone in workspace.docs.difference(&docs) {
             if index.doc_to_root.get(gone) == Some(root) {
                 index.doc_to_root.remove(gone);
             }
@@ -352,7 +354,7 @@ impl Authz {
         for doc in &docs {
             index.doc_to_root.insert(doc.clone(), root.clone());
         }
-        vault.watchers.retain(|doc, watcher| {
+        workspace.watchers.retain(|doc, watcher| {
             let keep = docs.contains(doc) && !watcher.is_finished();
             if !keep {
                 watcher.abort();
@@ -360,13 +362,13 @@ impl Authz {
             keep
         });
         for (folder, (handle, changes)) in loaded {
-            vault.watchers.entry(folder).or_insert_with(|| {
+            workspace.watchers.entry(folder).or_insert_with(|| {
                 tokio::spawn(self.clone().watch(root.clone(), handle, changes, true))
             });
         }
-        vault.notes = Some(notes.len());
+        workspace.notes = Some(notes.len());
         for note in notes {
-            vault
+            workspace
                 .watchers
                 .entry(note.clone())
                 .or_insert_with(|| tokio::spawn(self.clone().watch_note(root.clone(), note)));
@@ -378,17 +380,17 @@ impl Authz {
         let learned = pending.iter().any(|doc| creators.contains_key(doc));
         drop(creators);
 
-        vault.docs = docs;
-        vault.pending = pending;
+        workspace.docs = docs;
+        workspace.pending = pending;
 
         // A folder with a creator row and no content yet: its first frame has
         // been seen and the rest is still arriving. Look again shortly, a
         // bounded number of times, because nothing else will prompt it.
-        if missing_folder && vault.load_retries < MAX_LOAD_RETRIES {
-            vault.load_retries += 1;
+        if missing_folder && workspace.load_retries < MAX_LOAD_RETRIES {
+            workspace.load_retries += 1;
             wake.notify_one();
         } else if !missing_folder {
-            vault.load_retries = 0;
+            workspace.load_retries = 0;
         }
         if learned {
             wake.notify_one();
@@ -407,26 +409,26 @@ impl Authz {
         futures::pin_mut!(changes);
         while changes.next().await.is_some() {
             let mut index = self.0.reach.write().unwrap();
-            let Some(vault) = index.vaults.get_mut(&root) else {
+            let Some(workspace) = index.workspaces.get_mut(&root) else {
                 return;
             };
-            vault.last_change = Some(Utc::now());
-            vault.unsaved = true;
+            workspace.last_change = Some(Utc::now());
+            workspace.unsaved = true;
             if is_folder {
-                vault.wake.notify_one();
+                workspace.wake.notify_one();
             }
         }
     }
 
     async fn watch_note(self, root: DocumentId, note: DocumentId) {
-        // A note that will not load is tried again on the vault's next rebuild.
+        // A note that will not load is tried again on the workspace's next rebuild.
         if let Some(handle) = self.open(&note).await {
             let changes = handle.changes();
             self.watch(root, handle, changes, false).await;
         }
     }
 
-    /// Write `last_change_at` for the vaults that changed, once a minute.
+    /// Write `last_change_at` for the workspaces that changed, once a minute.
     pub(crate) fn start_last_change_flush(&self) {
         let authz = self.clone();
         tokio::spawn(async move {
@@ -437,23 +439,24 @@ impl Authz {
                     .reach
                     .write()
                     .unwrap()
-                    .vaults
+                    .workspaces
                     .iter_mut()
-                    .filter(|(_, vault)| vault.unsaved)
-                    .map(|(root, vault)| {
-                        vault.unsaved = false;
-                        (root.to_string(), vault.last_change)
+                    .filter(|(_, workspace)| workspace.unsaved)
+                    .map(|(root, workspace)| {
+                        workspace.unsaved = false;
+                        (root.to_string(), workspace.last_change)
                     })
                     .collect();
                 for (root, at) in changed {
-                    let saved =
-                        sqlx::query("UPDATE vaults SET last_change_at = $1 WHERE root_doc_id = $2")
-                            .bind(at)
-                            .bind(&root)
-                            .execute(&authz.0.pool)
-                            .await;
+                    let saved = sqlx::query(
+                        "UPDATE workspaces SET last_change_at = $1 WHERE root_doc_id = $2",
+                    )
+                    .bind(at)
+                    .bind(&root)
+                    .execute(&authz.0.pool)
+                    .await;
                     if let Err(e) = saved {
-                        tracing::warn!(vault = %root, error = %e, "could not save last change");
+                        tracing::warn!(workspace = %root, error = %e, "could not save last change");
                     }
                 }
             }
