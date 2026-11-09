@@ -77,7 +77,7 @@ fn held_entry(shape: Shape, held: &HeldWorkspace) -> Value {
     value
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
     scheme
@@ -85,15 +85,15 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .then_some(token.trim())
 }
 
-fn unauthorized() -> Response {
+pub(crate) fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response()
 }
 
-fn error(status: StatusCode, code: &str) -> Response {
+pub(crate) fn error(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({ "error": code }))).into_response()
 }
 
-fn internal_error(e: anyhow::Error) -> Response {
+pub(crate) fn internal_error(e: anyhow::Error) -> Response {
     tracing::error!(error = %e, "workspace request failed");
     error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
 }
