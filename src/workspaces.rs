@@ -130,12 +130,10 @@ async fn list(
     Json(body).into_response()
 }
 
-/// `GET /vaults`: the caller's own workspace and their groups', in the shape
-/// plugins up to 1.2.x read.
-pub async fn list_own_vaults(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn own(state: AppState, shape: Shape, headers: HeaderMap) -> Response {
     let verified = match state
         .verifier
-        .verify(bearer(&headers), &state.sync_audience)
+        .verify(bearer(&headers), &state.audience)
         .await
     {
         Ok(verified) => verified,
@@ -145,7 +143,20 @@ pub async fn list_own_vaults(State(state): State<AppState>, headers: HeaderMap) 
         }
     };
     let workspaces = state.authz.list_workspaces(&verified.caller).await;
-    list(&state, Shape::Vaults, workspaces).await
+    list(&state, shape, workspaces).await
+}
+
+/// `GET /vaults`: the caller's own workspace and their groups', in the shape
+/// plugins up to 1.2.x read.
+pub async fn list_own_vaults(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    own(state, Shape::Vaults, headers).await
+}
+
+/// `GET /v1/workspaces` on the `notes.` host: the caller's Private workspace
+/// and their groups' shared ones. Makes the Private workspace if they have
+/// none yet.
+pub async fn list_own(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    own(state, Shape::Workspaces, headers).await
 }
 
 /// The query Corliss lists a member's workspaces with. The groups are named

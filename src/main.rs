@@ -43,8 +43,10 @@ use storage::PostgresStorage;
 struct AppState {
     acceptor: AcceptorHandle,
     verifier: Arc<dyn DidVerifier>,
-    /// The audience a sync token must carry. Empty when nothing is verified.
-    sync_audience: Arc<str>,
+    /// The audience a member's token must carry on this listener's sync and
+    /// listing routes: the sync URL, or the `notes.` URL. Empty when nothing
+    /// is verified.
+    audience: Arc<str>,
     /// Who issues sync tokens, for the resource metadata. `None` with no
     /// verifier, where there is no issuer to name.
     oidc_issuer: Option<Arc<str>>,
@@ -88,10 +90,10 @@ async fn main() -> Result<()> {
         )
         .map_err(|_| anyhow::anyhow!("repo stopped before it could accept connections"))?;
 
-    let app = router(AppState {
+    let state = AppState {
         acceptor,
         verifier: Arc::clone(&verifier),
-        sync_audience: config
+        audience: config
             .auth
             .as_ref()
             .map(|auth| auth.sync_audience.as_str())
@@ -104,7 +106,8 @@ async fn main() -> Result<()> {
         authz: authz.clone(),
         enforce: config.require_auth,
         service_token: config.service_token.as_deref().map(Arc::from),
-    });
+    };
+    let app = router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&config.bind)
         .await
@@ -130,7 +133,7 @@ async fn main() -> Result<()> {
     };
 
     let mcp_app = mcp::router(
-        authz,
+        authz.clone(),
         Arc::clone(&verifier),
         &auth.mcp_audience,
         &auth.oidc_issuer,
@@ -141,7 +144,26 @@ async fn main() -> Result<()> {
     tracing::info!(bind = %config.mcp_bind, audience = %auth.mcp_audience, "MCP service listening");
     let mcp = axum::serve(mcp_listener, mcp_app).with_graceful_shutdown(shutdown());
 
-    tokio::try_join!(sync.into_future(), mcp.into_future()).context("server error")?;
+    let public_app = notes_router(
+        AppState {
+            audience: auth.public_url.as_str().into(),
+            ..state
+        },
+        mcp::router(
+            authz,
+            Arc::clone(&verifier),
+            &auth.public_mcp_url(),
+            &auth.oidc_issuer,
+        )?,
+    );
+    let public_listener = tokio::net::TcpListener::bind(&config.public_bind)
+        .await
+        .with_context(|| format!("could not bind {}", config.public_bind))?;
+    tracing::info!(bind = %config.public_bind, url = %auth.public_url, "notes listening");
+    let public = axum::serve(public_listener, public_app).with_graceful_shutdown(shutdown());
+
+    tokio::try_join!(sync.into_future(), mcp.into_future(), public.into_future())
+        .context("server error")?;
 
     Ok(())
 }
@@ -307,6 +329,22 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The `notes.` listener: everything a member's clients reach, on one host.
+///
+/// MCP at `/mcp`, versioned by its own protocol. The plugin's API under
+/// `/v1/`: a breaking change is a `/v2/` served beside it, never a change to
+/// `/v1/`. `/` is left free. `/internal/` is not served here at all, so this
+/// listener can be routed whole.
+fn notes_router(state: AppState, mcp: Router) -> Router {
+    Router::new()
+        .route("/v1/sync", get(sync))
+        .route("/v1/workspaces", get(workspaces::list_own))
+        .route("/health", get(health))
+        .route("/.well-known/oauth-protected-resource", get(sync_metadata))
+        .with_state(state)
+        .merge(mcp)
+}
+
 /// Pick the verifier, or refuse to start.
 ///
 /// Fails closed on purpose. `require_auth` defaults to true, and `Config`
@@ -340,7 +378,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 async fn sync_metadata(State(state): State<AppState>) -> Response {
     match &state.oidc_issuer {
         Some(issuer) => Json(serde_json::json!({
-            "resource": &*state.sync_audience,
+            "resource": &*state.audience,
             "authorization_servers": [&**issuer],
             "bearer_methods_supported": ["header", "query"],
         }))
@@ -367,7 +405,7 @@ async fn sync(
     // nothing here logs it, and the proxy in front must not either.
     let verified = match state
         .verifier
-        .verify(query.access_token.as_deref(), &state.sync_audience)
+        .verify(query.access_token.as_deref(), &state.audience)
         .await
     {
         Ok(verified) => verified,
@@ -441,13 +479,16 @@ mod tests {
     const ALICE: &str = "did:plc:alice";
     const BOB: &str = "did:plc:bob";
 
-    /// A running relay: both listeners on loopback ports, on the test's own
-    /// database, gated by a verifier that trusts the test issuer.
+    /// A running relay: all three listeners on loopback ports, on the test's
+    /// own database, gated by a verifier that trusts the test issuer.
     struct Relay {
         /// Base URL of the sync listener.
         base: String,
         /// The MCP URL, which is also the audience an MCP token must carry.
         mcp: String,
+        /// The `notes.` listener's URL: the audience a plugin's token carries
+        /// there, and with `/mcp` after it, an MCP client's.
+        notes: String,
         authz: Authz,
         repo: Repo,
     }
@@ -460,27 +501,52 @@ mod tests {
         let acceptor = repo
             .make_acceptor("ws://relay.test/sync".parse().unwrap())
             .unwrap();
-        let app = router(AppState {
+        let state = AppState {
             acceptor,
             verifier: Arc::clone(&verifier),
-            sync_audience: SYNC_AUDIENCE.into(),
+            audience: SYNC_AUDIENCE.into(),
             oidc_issuer: Some(auth::tests::ISSUER.into()),
             authz: authz.clone(),
             enforce: true,
             service_token: Some(SERVICE_TOKEN.into()),
-        });
+        };
+        let app = router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mcp = format!("http://{}", listener.local_addr().unwrap());
-        let app = mcp::router(authz.clone(), verifier, &mcp, auth::tests::ISSUER).unwrap();
+        let app = mcp::router(
+            authz.clone(),
+            Arc::clone(&verifier),
+            &mcp,
+            auth::tests::ISSUER,
+        )
+        .unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let notes = format!("http://{}", listener.local_addr().unwrap());
+        let app = notes_router(
+            AppState {
+                audience: notes.as_str().into(),
+                ..state
+            },
+            mcp::router(
+                authz.clone(),
+                verifier,
+                &format!("{notes}/mcp"),
+                auth::tests::ISSUER,
+            )
+            .unwrap(),
+        );
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         Relay {
             base,
             mcp,
+            notes,
             authz,
             repo,
         }
@@ -1087,6 +1153,216 @@ mod tests {
         assert_eq!(closed.reason.as_str(), "token expired");
         // Not closed early: it stayed open until `exp`.
         assert!(opened.elapsed() >= std::time::Duration::from_millis(900));
+    }
+
+    impl Relay {
+        /// A token for the `notes.` host, as the plugin holds one.
+        fn notes_token(&self, did: &str, groups: &[&str]) -> String {
+            TokenSpec::default()
+                .claim("sub", json!(did))
+                .claim("aud", json!(self.notes))
+                .claim("workspaces", json!(groups))
+                .sign()
+        }
+
+        /// A token for MCP on the `notes.` host.
+        fn notes_mcp_token(&self, did: &str) -> String {
+            TokenSpec::default()
+                .claim("sub", json!(did))
+                .claim("aud", json!(format!("{}/mcp", self.notes)))
+                .sign()
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn the_notes_host_serves_sync_and_the_listing_on_one_token(pool: PgPool) {
+        let relay = start(&pool).await;
+        let notes = &relay.notes;
+        let token = relay.notes_token(BOB, &["7"]);
+        relay
+            .authz
+            .group_workspace(&auth::Did(ALICE.into()), "7", "Garden")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            upgrade(&format!("{notes}/v1/sync?access_token={token}")).await,
+            StatusCode::SWITCHING_PROTOCOLS
+        );
+        let listing: Value = reqwest::Client::new()
+            .get(format!("{notes}/v1/workspaces"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listing["root_folders"], json!(["Private", "Workspaces"]));
+        let entries: Vec<_> = listing["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| (w["path"].clone(), w["group_id"].clone()))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                (json!("Workspaces/Garden"), json!("7")),
+                (json!("Private"), Value::Null)
+            ]
+        );
+
+        // Tokens for the old hosts, or for MCP, are not for these routes.
+        let mcp_here = relay.notes_mcp_token(BOB);
+        for wrong in [member_token(BOB), relay.mcp_token(BOB), mcp_here] {
+            assert_eq!(
+                upgrade(&format!("{notes}/v1/sync?access_token={wrong}")).await,
+                StatusCode::UNAUTHORIZED
+            );
+            let status = reqwest::Client::new()
+                .get(format!("{notes}/v1/workspaces"))
+                .bearer_auth(&wrong)
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn the_notes_host_serves_mcp_at_its_path(pool: PgPool) {
+        let relay = start(&pool).await;
+        let notes = &relay.notes;
+        let mcp = format!("{notes}/mcp");
+        let rpc = |token: Option<String>| {
+            let mut request = reqwest::Client::new()
+                .post(&mcp)
+                .header("accept", "application/json, text/event-stream")
+                .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            request.send()
+        };
+
+        let response = rpc(Some(relay.notes_mcp_token(ALICE))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 6);
+
+        // The plugin's token is not an MCP token, and a refusal says where to
+        // find the issuer.
+        let metadata_url = format!("{notes}/.well-known/oauth-protected-resource/mcp");
+        for token in [None, Some(relay.notes_token(ALICE, &[]))] {
+            let response = rpc(token).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers()["www-authenticate"],
+                format!("Bearer resource_metadata=\"{metadata_url}\"")
+            );
+        }
+
+        // Two metadata documents, one per resource.
+        let get = |url: String| async move {
+            reqwest::get(url)
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        };
+        let for_mcp = get(metadata_url.clone()).await;
+        assert_eq!(for_mcp["resource"], mcp);
+        assert_eq!(
+            for_mcp["authorization_servers"],
+            json!([auth::tests::ISSUER])
+        );
+        let for_plugin = get(format!("{notes}/.well-known/oauth-protected-resource")).await;
+        assert_eq!(for_plugin["resource"], *notes);
+        assert_eq!(
+            for_plugin["bearer_methods_supported"],
+            json!(["header", "query"])
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn the_notes_host_serves_nothing_else(pool: PgPool) {
+        let relay = start(&pool).await;
+        let notes = &relay.notes;
+        let token = relay.notes_token(ALICE, &[]);
+        let client = reqwest::Client::new();
+        for path in [
+            "/",
+            "/sync",
+            "/vaults",
+            "/v1/vaults",
+            "/internal/workspaces?did=did:plc:alice",
+            "/internal/workspaces/all",
+            "/internal/vaults/all",
+        ] {
+            let status = client
+                .get(format!("{notes}{path}"))
+                .bearer_auth(SERVICE_TOKEN)
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        }
+        // Not even as a websocket at the root, where the old host has one.
+        assert_eq!(
+            upgrade(&format!("{notes}/?access_token={token}")).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_device_on_the_old_host_and_one_on_notes_see_each_others_edits(pool: PgPool) {
+        let relay = start(&pool).await;
+        let old_laptop = client(&relay.base, ALICE).await;
+        let note = old_laptop.create(doc_with("title", "plan")).await.unwrap();
+        let id = note.document_id().clone();
+        authz::tests::eventually("the relay has the note", || {
+            relay.authz.creator_of(&id).is_some()
+        })
+        .await;
+
+        let url = format!(
+            "{}/v1/sync?access_token={}",
+            relay.notes.replace("http://", "ws://"),
+            relay.notes_token(ALICE, &[])
+        );
+        let new_phone = Repo::build_tokio().load().await;
+        new_phone
+            .dial(
+                samod::BackoffConfig::default(),
+                Arc::new(WsDialer(url.parse().unwrap())),
+            )
+            .unwrap()
+            .established()
+            .await
+            .unwrap();
+        let on_phone = new_phone.find(id).await.unwrap().expect("found");
+        assert_eq!(value_of(&on_phone, "title").await.as_deref(), Some("plan"));
+
+        on_phone
+            .with_document_async(|doc| {
+                use automerge::transaction::Transactable;
+                let mut tx = doc.transaction();
+                tx.put(automerge::ROOT, "status", "done").unwrap();
+                tx.commit();
+            })
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if value_of(&note, "status").await.as_deref() == Some("done") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the phone's edit never reached the laptop");
     }
 
     impl Relay {
