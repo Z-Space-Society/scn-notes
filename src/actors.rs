@@ -422,6 +422,118 @@ impl Authz {
     }
 }
 
+impl Authz {
+    /// Who each of these actors is, for a document the caller may open:
+    /// `None` when they may not. An actor gets a DID only when it made a
+    /// change in this document and the relay knows its member, so a caller
+    /// cannot learn about actors from documents they cannot see.
+    pub async fn document_actors(
+        &self,
+        caller: &Caller,
+        doc: &DocumentId,
+        asked: Vec<ActorId>,
+    ) -> Result<Option<Vec<(ActorId, Option<Did>)>>> {
+        if !self.may_open(caller, doc) {
+            return Ok(None);
+        }
+        let Some(handle) = self.open(doc).await else {
+            return Ok(None);
+        };
+        let present: HashSet<ActorId> = handle
+            .with_document_async(|doc| {
+                doc.get_changes(&[])
+                    .iter()
+                    .map(|change| change.actor_id().clone())
+                    .collect()
+            })
+            .await
+            .map_err(|_| anyhow!("repo stopped"))?;
+        Ok(Some(
+            asked
+                .into_iter()
+                .map(|actor| {
+                    let did = present
+                        .contains(&actor)
+                        .then(|| self.actor_owner(&actor))
+                        .flatten();
+                    (actor, did)
+                })
+                .collect(),
+        ))
+    }
+}
+
+/// The most actors one request may ask about.
+pub(crate) const MAX_ACTORS: usize = 1000;
+
+#[derive(serde::Deserialize)]
+pub struct ActorsAsked {
+    actors: Vec<String>,
+}
+
+/// `POST /v1/documents/{id}/actors` on the `notes.` host: the DID behind
+/// each actor ID the plugin found in a document it holds. Same token as
+/// `/v1/workspaces`. Every actor asked about is answered, with `"did": null`
+/// where the relay does not know it. A document the caller may not open is a
+/// `404`, the same as one that does not exist.
+pub async fn serve_document_actors(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::Json(body): axum::Json<ActorsAsked>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    use crate::workspaces::{bearer, error, internal_error, unauthorized};
+
+    let verified = match state
+        .verifier
+        .verify(bearer(&headers), &state.audience)
+        .await
+    {
+        Ok(verified) => verified,
+        Err(e) => {
+            tracing::info!(error = %e, "refused an actor lookup");
+            return unauthorized();
+        }
+    };
+    if body.actors.len() > MAX_ACTORS {
+        return error(StatusCode::BAD_REQUEST, "too_many_actors");
+    }
+    let Ok(asked) = body
+        .actors
+        .iter()
+        .map(|raw| ActorId::from_str(raw))
+        .collect::<std::result::Result<Vec<_>, _>>()
+    else {
+        return error(StatusCode::BAD_REQUEST, "invalid_actor");
+    };
+    let Ok(doc) = DocumentId::from_str(&id) else {
+        return error(StatusCode::NOT_FOUND, "not_found");
+    };
+    match state
+        .authz
+        .document_actors(&verified.caller, &doc, asked)
+        .await
+    {
+        Ok(Some(answered)) => {
+            let actors: serde_json::Map<String, serde_json::Value> = answered
+                .into_iter()
+                .map(|(actor, did)| {
+                    (
+                        actor.to_hex_string(),
+                        serde_json::json!({ "did": did.map(|did| did.0) }),
+                    )
+                })
+                .collect();
+            axum::Json(serde_json::json!({ "actors": actors })).into_response()
+        }
+        Ok(None) => error(StatusCode::NOT_FOUND, "not_found"),
+        Err(e) => internal_error(e),
+    }
+}
+
 /// Run `write` on the document as `actor`, and put its own actor back after.
 pub(crate) fn as_actor<R>(
     doc: &mut Automerge,

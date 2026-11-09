@@ -27,7 +27,7 @@ use axum::{
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use samod::{AcceptorHandle, Repo, ShareConfig};
@@ -339,6 +339,10 @@ fn notes_router(state: AppState, mcp: Router) -> Router {
     Router::new()
         .route("/v1/sync", get(sync))
         .route("/v1/workspaces", get(workspaces::list_own))
+        .route(
+            "/v1/documents/{id}/actors",
+            post(actors::serve_document_actors),
+        )
         .route("/health", get(health))
         .route("/.well-known/oauth-protected-resource", get(sync_metadata))
         .with_state(state)
@@ -1229,6 +1233,75 @@ mod tests {
                 .status();
             assert_eq!(status, StatusCode::UNAUTHORIZED);
         }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn the_notes_host_names_the_member_behind_each_actor(pool: PgPool) {
+        let relay = start(&pool).await;
+        relay
+            .ok(
+                ALICE,
+                "create_note",
+                json!({ "path": "Private/plan.md", "content": "dig beds" }),
+            )
+            .await;
+        let alice = auth::Did(ALICE.into());
+        let (_, doc) = mcp::tests::notes_of(&relay.authz, &alice)
+            .await
+            .into_iter()
+            .find(|(path, _)| path == "plan.md")
+            .unwrap();
+        let hers = relay.authz.mcp_actor(&alice).await.unwrap();
+        // Bob's actor is known to the relay, but made nothing in this note.
+        let his = relay.authz.mcp_actor(&auth::Did(BOB.into())).await.unwrap();
+        let stranger = automerge::ActorId::random();
+
+        let url = format!("{}/v1/documents/{doc}/actors", relay.notes);
+        let ask = |token: Option<String>, actors: Vec<String>| {
+            let mut request = reqwest::Client::new()
+                .post(&url)
+                .json(&json!({ "actors": actors }));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            request.send()
+        };
+        let asked = vec![
+            hers.to_hex_string(),
+            his.to_hex_string(),
+            stranger.to_hex_string(),
+        ];
+
+        let response = ask(Some(relay.notes_token(ALICE, &[])), asked.clone())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        let actors = &body["actors"];
+        assert_eq!(actors[hers.to_hex_string()]["did"], ALICE);
+        assert_eq!(actors[his.to_hex_string()]["did"], Value::Null);
+        assert_eq!(actors[stranger.to_hex_string()]["did"], Value::Null);
+
+        // Bob may not open her Private note, and needs a token at all.
+        let status = |r: reqwest::Result<reqwest::Response>| r.unwrap().status();
+        assert_eq!(
+            status(ask(Some(relay.notes_token(BOB, &[])), asked.clone()).await),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(ask(None, asked.clone()).await),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(
+                ask(
+                    Some(relay.notes_token(ALICE, &[])),
+                    vec![stranger.to_hex_string(); actors::MAX_ACTORS + 1]
+                )
+                .await
+            ),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[sqlx::test(migrations = false)]

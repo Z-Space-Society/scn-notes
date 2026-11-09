@@ -112,6 +112,7 @@ On the `notes.` listener (`PUBLIC_BIND`), everything a member's clients reach:
 | `POST /mcp` | MCP client | MCP over Streamable HTTP. `Authorization: Bearer` with a token whose `aud` is `PUBLIC_URL/mcp`. Not versioned in the path: MCP agrees its protocol version when a client connects, and clients read the tool list each session. |
 | `GET /v1/sync` | plugin | WebSocket upgrade; the automerge-repo sync protocol. The token rides in the query, `?access_token=`, with `PUBLIC_URL` as its `aud`. |
 | `GET /v1/workspaces` | plugin | The caller's workspaces, as `{"workspaces", "root_folders"}`. Makes the Private workspace if they have none yet. `Authorization: Bearer` with the same token as `/v1/sync`. |
+| `POST /v1/documents/{id}/actors` | plugin | The member behind each actor in a document (see [Actors](#actors)). `Authorization: Bearer` with the same token as `/v1/sync`. |
 | `GET /.well-known/oauth-protected-resource` | anyone | The plugin's resource: `resource` is `PUBLIC_URL`, `authorization_servers` is the issuer. A plugin given only the notes URL finds Corliss here. |
 | `GET /.well-known/oauth-protected-resource/mcp` | anyone | The MCP resource: `resource` is `PUBLIC_URL/mcp`. A refused MCP request points here. |
 | `GET /health` | anyone | Liveness, as on the sync listener. |
@@ -170,6 +171,25 @@ before the upgrade. Once connected:
   its folder documents list, on every connection.
 - The connection is closed with code `1008` and reason `token expired` when
   its token's `exp` passes. The client reconnects with a fresh token.
+
+### Actors
+
+The plugin reads a note's history from its own copy, where each change names
+only an actor ID. `POST /v1/documents/{id}/actors`, with `{id}` the document
+ID and a body of `{"actors": ["<actor hex>", ...]}` (at most 1000), answers:
+
+```json
+{ "actors": { "<actor hex>": { "did": "did:plc:..." } } }
+```
+
+- Every actor asked about is in the answer. `did` is `null` when the relay
+  does not know whose it is, which is most edits to shared-workspace notes
+  from before v0.6.0, and also for an actor that made no change in this
+  document, so a caller learns nothing about documents they cannot open.
+- A document the caller may not open is a `404`, the same as one that does
+  not exist. A bad actor ID or too many is a `400`.
+- Each actor is an object so that more about the member, such as a handle or
+  name, can be added within `/v1/`.
 
 ### Workspaces
 
