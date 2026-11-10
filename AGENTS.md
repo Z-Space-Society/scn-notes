@@ -201,7 +201,7 @@ one the path means.
   old behaviour.
 - Errors: `anyhow` in the binary and internal paths; API errors are
   `{"error": "<code>"}` with stable snake_case codes (`invalid_did`,
-  `invalid_name`, `invalid_group`). Do not leak internal reasons to a peer.
+  `invalid_name`, `invalid_workspace`). Do not leak internal reasons to a peer.
 - Use `DocHandle::with_document_async` for document work in async contexts.
   Never block the runtime on a long walk or a slow edit.
 - New code says **workspace**, not vault. Keep `vault` only where an external
@@ -214,9 +214,10 @@ one the path means.
 
 - Work on a branch, not `main`. Keep commits and PRs focused: one concern per
   PR, with a message that says what changed and why.
-- Do not bump the version or push a tag unless the task is a release. Releases
-  use an **annotated** tag pushed to the remote; deployment checks out the tag,
-  not a branch.
+- Do not bump the version or push a tag unless the task is a release. A
+  release is `gh release create vX.Y.Z --generate-notes` after the bump merges
+  (see the README's [Releasing](README.md#releasing)); deployment checks out
+  the tag, not a branch.
 - Do not commit secrets, tokens, database URLs, or real member data. Test
   fixtures are synthetic.
 - The software is `scn-notes`; the GitHub repository is
@@ -224,24 +225,14 @@ one the path means.
 
 ## Working against the live service
 
-The deployment is a single `scn-notes` process under systemd with Postgres,
-behind a reverse proxy. Three listeners exist while the old hosts are still
-served:
+A deployment is a single `scn-notes` process under systemd with Postgres,
+behind a reverse proxy. Each cluster serves it from its own `notes.` origin.
+The listeners, their routes, and the rules the proxy has to keep are in the
+README's [Endpoints](README.md#endpoints) section.
 
-| Listener | Public host | Serves |
-|---|---|---|
-| `PUBLIC_BIND` (:7032) | `notes.` | `/mcp`, `/v1/sync`, `/v1/workspaces`, `/v1/documents/{id}/actors`, `/.well-known/oauth-protected-resource*`, `/health`. |
-| `BIND` (:7030) | `sync.` (legacy) | `/` and `/sync` WebSockets, `/vaults`, `/internal/*`, `/.well-known/oauth-protected-resource`, `/health`. |
-| `MCP_BIND` (:7031) | `mcp.` (legacy) | MCP at its configured path, plus its resource metadata. |
-
-Members' clients should use the `notes.` host. The legacy sync and MCP listeners
-retire in issue #19. `/internal/` is for Corliss on the internal network only.
-
-The production MCP endpoint is `https://notes.sharedcomputer.network/mcp`.
-Access is per member through Corliss OAuth; there is no shared token. In
-OpenCode, authenticate the remote server with `opencode mcp auth scn-notes`
-after it is configured. Tokens are personal: never commit, paste, or share
-them, and never use another member's token to act as them.
+MCP access is per member through Corliss OAuth; there is no shared token.
+Tokens are personal: never commit, paste, or share them, and never use another
+member's token to act as them.
 
 ## When in doubt
 

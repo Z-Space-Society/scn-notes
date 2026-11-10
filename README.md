@@ -39,7 +39,7 @@ flowchart TB
         filter["Transport filter<br/>may_open every frame<br/>closes at token exp"]
         authz["Authz<br/>may_open · workspaces<br/>doc_creators · actor_members"]
         reach["Reachability index<br/>(memory, from folder docs)"]
-        mcpsvc["MCP service (rmcp)<br/>7 tools"]
+        mcpsvc["MCP service (rmcp)<br/>note tools"]
         repo["samod Repo<br/>automerge-repo protocol"]
         store["PostgresStorage"]
     end
@@ -78,10 +78,8 @@ flowchart TB
   token. Tools read and edit the same documents, so an MCP edit reaches every
   connected device through normal sync.
 
-The proxy must never route `/internal/` on the `sync.` host and must not log
-query strings on either sync route: the token rides there because a browser or
-phone WebSocket cannot set an `Authorization` header. The `notes.` listener does
-not serve `/internal/`, so that host can be routed whole.
+Each listener's routes, and the two rules the proxy in front has to keep, are
+under [Endpoints](#endpoints).
 
 ## Status: Phase B
 
@@ -560,11 +558,12 @@ and drops it when it passes.
 
 ## Releasing
 
-Deployment checks out an **annotated tag**, so the tag has to reach the remote:
+Deployment checks out a release tag, so the tag has to reach the remote. Merge
+the version bump to `main`, then create the release on GitHub, which tags
+`main` there:
 
 ```sh
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin main --follow-tags
+gh release create v0.1.0 --generate-notes
 git ls-remote --tags origin       # the check that matters
 ```
 
