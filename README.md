@@ -10,6 +10,79 @@ Built on [`samod`](https://crates.io/crates/samod), the Rust automerge-repo
 implementation. A single static binary under systemd: no Node runtime, no
 container.
 
+## Architecture
+
+Members' devices sync Automerge documents through the relay; MCP clients act as
+the same member over the same documents. Corliss is the only source of identity
+and group membership: it issues short-lived tokens, and the relay checks every
+document access against the workspace the document belongs to.
+
+```mermaid
+flowchart TB
+    subgraph clients["Member devices"]
+        obs["Obsidian<br/>SCN Sync plugin"]
+        mcpcli["MCP client<br/>(Claude, Claude Code, …)"]
+        synccli["automerge-repo clients"]
+    end
+
+    corliss["Corliss<br/>OIDC issuer · membership · groups"]
+    proxy["Reverse proxy<br/>TLS · routing<br/>no query strings in logs"]
+
+    subgraph relay["scn-notes — one Rust binary"]
+        direction TB
+        subgraph listeners["Three listeners"]
+            notes_l["notes. :7032<br/>/v1/sync · /v1/workspaces<br/>/v1/documents/{id}/actors<br/>/mcp · /.well-known/*"]
+            sync_l["sync. :7030 (legacy)<br/>/ · /sync websockets<br/>/vaults · /internal/*"]
+            mcp_l["mcp. :7031 (legacy)<br/>MCP at its path"]
+        end
+        verifier["CorlissVerifier<br/>RS256 · JWKS cache"]
+        filter["Transport filter<br/>may_open every frame<br/>closes at token exp"]
+        authz["Authz<br/>may_open · workspaces<br/>doc_creators · actor_members"]
+        reach["Reachability index<br/>(memory, from folder docs)"]
+        mcpsvc["MCP service (rmcp)<br/>7 tools"]
+        repo["samod Repo<br/>automerge-repo protocol"]
+        store["PostgresStorage"]
+    end
+
+    db[("Postgres<br/>storage · workspaces<br/>doc_creators · actor_members")]
+
+    clients -- "sync: JWT in ?access_token=<br/>MCP: Bearer JWT" --> proxy
+    corliss -. "OIDC sign-in<br/>issues 15-minute JWT" .-> clients
+    corliss -- "service token<br/>/internal/workspaces" --> sync_l
+
+    proxy --> notes_l
+    proxy --> sync_l
+    proxy --> mcp_l
+
+    notes_l --> verifier
+    sync_l --> verifier
+    mcp_l --> verifier
+    verifier --> filter
+    verifier --> mcpsvc
+    filter --> authz
+    filter --> repo
+    mcpsvc --> authz
+    authz --> repo
+    reach -. "walks folder documents" .-> repo
+    repo --> store
+    store --> db
+```
+
+- **Sync** carries Automerge changes. The filter decides per frame whether the
+  connection's member may open the document it names, records who created a
+  document first, and closes the socket when the token expires.
+- **Authorization** is derived from the folder documents in a workspace and
+  the `doc_creators` record. A folder entry is not enough: the workspace's owner
+  (or a member of its group) must have created the document.
+- **MCP** is the same repo behind a second listener, acting as the member in the
+  token. Tools read and edit the same documents, so an MCP edit reaches every
+  connected device through normal sync.
+
+The proxy must never route `/internal/` on the `sync.` host and must not log
+query strings on either sync route: the token rides there because a browser or
+phone WebSocket cannot set an `Authorization` header. The `notes.` listener does
+not serve `/internal/`, so that host can be routed whole.
+
 ## Status: Phase B
 
 Every connection is authenticated as an SCN member and can open only that
