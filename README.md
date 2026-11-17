@@ -250,7 +250,7 @@ only an actor ID. `POST /v1/documents/{id}/actors`, with `{id}` the document
 ID and a body of `{"actors": ["<actor hex>", ...]}` (at most 1000), answers:
 
 ```json
-{ "actors": { "<actor hex>": { "did": "did:plc:..." } } }
+{ "actors": { "<actor hex>": { "did": "did:plc:...", "handle": "alice.example.com" } } }
 ```
 
 - Every actor asked about is in the answer. `did` is `null` when the relay
@@ -259,8 +259,27 @@ ID and a body of `{"actors": ["<actor hex>", ...]}` (at most 1000), answers:
   document, so a caller learns nothing about documents they cannot open.
 - A document the caller may not open is a `404`, the same as one that does
   not exist. A bad actor ID or too many is a `400`.
-- Each actor is an object so that more about the member, such as a handle or
-  name, can be added within `/v1/`.
+- `handle` is present only when it could be verified (see
+  [Handles](#handles)). Without it, show the DID.
+- Each actor is an object so that more about the member can be added within
+  `/v1/`.
+
+### Handles
+
+History and the actors endpoint name a member by their handle beside their
+DID. The relay reads the handle the member's DID document claims, from
+plc.directory for `did:plc:` or from the host for `did:web:`, and shows it
+only if the handle points back: its `_atproto.<handle>` TXT record, or else
+`https://<handle>/.well-known/atproto-did`, names the same DID. A DID
+document can claim anyone's handle, so an unverified one is never shown.
+
+- These are outbound requests from the relay: HTTPS to plc.directory, to
+  `did:web` hosts and to handle domains, and DNS through the system resolver.
+- All the DIDs in one answer are looked up at once, within about 3 seconds.
+  A DID that fails or runs out of time is shown without a handle; the answer
+  is never refused for it.
+- Answers are kept in memory, a handle for an hour and a miss for five
+  minutes, and nothing is written to Postgres.
 
 ### Workspaces
 
@@ -416,7 +435,9 @@ and never changes the note.
   run of changes under one Automerge actor, which is one member's session on
   one device, or a stretch of their MCP edits. Each group has an `id`, the
   member's DID, the device's time at its first and last change, and the
-  characters added and removed. `limit` caps the groups (20 by default, at
+  characters added and removed. It also has the member's `handle` when one
+  is verified (see [Handles](#handles)), `"you": true` on the caller's own
+  changes, and `"via": "mcp"` on changes made through these tools. `limit` caps the groups (20 by default, at
   most 100).
 - **With `version`**, one group's `id`, it returns the note's text as that
   change left it. To restore it, create a new note from that text; nothing

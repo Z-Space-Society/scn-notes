@@ -45,6 +45,9 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The `_atproto` TXT lookup that verifies a member's handle. Pure Rust, with
+# the system resolver configuration.
+hickory-resolver = "0.26.3"
 
 [dev-dependencies]
 # `#[sqlx::test]` gives each test its own database on the server DATABASE_URL

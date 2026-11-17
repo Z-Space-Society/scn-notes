@@ -31,6 +31,7 @@ use serde_json::json;
 
 use crate::auth::DidVerifier;
 use crate::authz::Authz;
+use crate::handles::Handles;
 
 const METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
 
@@ -51,6 +52,7 @@ struct McpState {
 /// answers to, and its path is where the service is mounted.
 pub fn router(
     authz: Authz,
+    handles: Handles,
     verifier: Arc<dyn DidVerifier>,
     audience: &str,
     issuer: &str,
@@ -76,7 +78,7 @@ pub fn router(
 
     let service: StreamableHttpService<tools::NotesServer, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(tools::NotesServer::new(authz.clone())),
+            move || Ok(tools::NotesServer::new(authz.clone(), handles.clone())),
             Default::default(),
             StreamableHttpServerConfig::default()
                 // rmcp answers only loopback hosts unless told otherwise.
