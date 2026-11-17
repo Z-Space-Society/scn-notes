@@ -26,7 +26,7 @@ subtle = "2"
 minicbor = { version = "1", features = ["std"] }
 # Pure-Rust crypto for token checks, and ring for TLS (the provider sqlx already
 # builds), so the deploy's cold build needs no second C crypto library.
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls-no-provider",
     "json",
@@ -54,4 +54,4 @@ hickory-resolver = "0.26.3"
 # points at.
 sqlx = { version = "0.9", default-features = false, features = ["macros", "migrate"] }
 # A plain websocket client: the test sync client dials with it.
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"

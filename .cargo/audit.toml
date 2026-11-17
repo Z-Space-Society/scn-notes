@@ -1,0 +1,11 @@
+# `cargo audit` settings. Every ignore says why it does not apply here; drop it
+# when the reason stops being true.
+
+[advisories]
+ignore = [
+    # libsqlite3-sys (C SQLite). sqlx lists it in Cargo.lock as an optional
+    # dependency, but the sqlite feature is never enabled: `cargo tree -e all
+    # -i libsqlite3-sys` prints nothing, and it is never compiled. The relay
+    # is Postgres only.
+    "RUSTSEC-2026-0459",
+]
