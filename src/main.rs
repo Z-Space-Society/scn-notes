@@ -9,6 +9,7 @@ mod auth;
 mod authz;
 mod config;
 mod filter;
+mod handles;
 mod mcp;
 mod reach;
 mod storage;
@@ -37,6 +38,7 @@ use sqlx::postgres::PgPoolOptions;
 use auth::{AllowAll, CorlissVerifier, DidVerifier, Verified};
 use authz::Authz;
 use config::Config;
+use handles::{AtprotoResolver, Handles};
 use storage::PostgresStorage;
 
 #[derive(Clone)]
@@ -56,6 +58,8 @@ struct AppState {
     enforce: bool,
     /// What Corliss presents on `/internal/workspaces`. `None` refuses every call.
     service_token: Option<Arc<str>>,
+    /// Members' verified handles, shown beside their DIDs.
+    handles: Handles,
 }
 
 #[tokio::main]
@@ -79,6 +83,7 @@ async fn main() -> Result<()> {
     let verifier = build_verifier(&config).await?;
     let (repo, authz) = open_relay(&config).await?;
     authz.start_actor_backfill();
+    let handles = Handles::new(Arc::new(AtprotoResolver::new()?));
 
     // The URL is used only to identify this endpoint in samod's own logs; it
     // is not something the relay binds or dials.
@@ -106,6 +111,7 @@ async fn main() -> Result<()> {
         authz: authz.clone(),
         enforce: config.require_auth,
         service_token: config.service_token.as_deref().map(Arc::from),
+        handles: handles.clone(),
     };
     let app = router(state.clone());
 
@@ -134,6 +140,7 @@ async fn main() -> Result<()> {
 
     let mcp_app = mcp::router(
         authz.clone(),
+        handles.clone(),
         Arc::clone(&verifier),
         &auth.mcp_audience,
         &auth.oidc_issuer,
@@ -151,6 +158,7 @@ async fn main() -> Result<()> {
         },
         mcp::router(
             authz,
+            handles,
             Arc::clone(&verifier),
             &auth.public_mcp_url(),
             &auth.oidc_issuer,
@@ -502,6 +510,10 @@ mod tests {
         let issuer = Issuer::start().await;
         let verifier: Arc<dyn DidVerifier> = Arc::new(issuer.verifier().await);
         let (authz, repo) = authz::tests::open(pool).await;
+        let handles = Handles::new(Arc::new(handles::tests::FakeResolver::with(&[(
+            ALICE,
+            "alice.test",
+        )])));
         let acceptor = repo
             .make_acceptor("ws://relay.test/sync".parse().unwrap())
             .unwrap();
@@ -513,6 +525,7 @@ mod tests {
             authz: authz.clone(),
             enforce: true,
             service_token: Some(SERVICE_TOKEN.into()),
+            handles: handles.clone(),
         };
         let app = router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -523,6 +536,7 @@ mod tests {
         let mcp = format!("http://{}", listener.local_addr().unwrap());
         let app = mcp::router(
             authz.clone(),
+            handles.clone(),
             Arc::clone(&verifier),
             &mcp,
             auth::tests::ISSUER,
@@ -539,6 +553,7 @@ mod tests {
             },
             mcp::router(
                 authz.clone(),
+                handles,
                 verifier,
                 &format!("{notes}/mcp"),
                 auth::tests::ISSUER,
@@ -1279,7 +1294,9 @@ mod tests {
         let body: Value = response.json().await.unwrap();
         let actors = &body["actors"];
         assert_eq!(actors[hers.to_hex_string()]["did"], ALICE);
+        assert_eq!(actors[hers.to_hex_string()]["handle"], "alice.test");
         assert_eq!(actors[his.to_hex_string()]["did"], Value::Null);
+        assert_eq!(actors[his.to_hex_string()]["handle"], Value::Null);
         assert_eq!(actors[stranger.to_hex_string()]["did"], Value::Null);
 
         // Bob may not open her Private note, and needs a token at all.
@@ -1757,6 +1774,14 @@ mod tests {
         let groups = listing["groups"].as_array().unwrap();
         assert_eq!(groups[0]["did"], BOB);
         assert_eq!(groups[1]["did"], ALICE);
+        // Alice is asking: her handle is verified, Bob's is not, and both
+        // edits came through these tools.
+        assert_eq!(groups[1]["handle"], "alice.test");
+        assert_eq!(groups[1]["you"], true);
+        assert_eq!(groups[0]["handle"], Value::Null);
+        assert_eq!(groups[0]["you"], Value::Null);
+        assert_eq!(groups[0]["via"], "mcp");
+        assert_eq!(groups[1]["via"], "mcp");
         assert!(groups[0]["device_time"]["to"].is_string());
         assert_eq!(listing["more"], false);
         let (bobs, alices) = (

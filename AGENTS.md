@@ -61,6 +61,7 @@ cold-builds this repository on the target's glibc.
 | `src/wire.rs` | Minimal CBOR envelope reader for the sync protocol. |
 | `src/workspaces.rs` | `/vaults`, `/internal/vaults*`, `/v1/workspaces`, `/internal/workspaces*`. |
 | `src/actors.rs` | Maps Automerge actors to members; owns the actor-history backfill. |
+| `src/handles.rs` | DID → verified handle for history and the actors endpoint; in-memory cache, the relay's only outbound identity lookups. |
 | `src/mcp/` | MCP listener (`mod.rs`), tools (`tools.rs`), note/folder document I/O (`notes.rs`), search (`search.rs`), history (`history.rs`). |
 | `src/unfiled.rs` | The `file-unfiled` command: orphans, recovery folder, deletion. |
 | `src/storage.rs` | samod `Storage` over one Postgres key/value table. |

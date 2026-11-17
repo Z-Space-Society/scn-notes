@@ -183,6 +183,13 @@ impl Authz {
         Ok(Verdict::Pass)
     }
 
+    /// Whether this is some member's MCP actor, so its changes came through
+    /// the MCP tools rather than a device.
+    pub fn is_mcp_actor(&self, actor: &ActorId) -> bool {
+        let actors = self.0.actors.read().unwrap();
+        actors.owners.get(actor).and_then(|did| actors.mcp.get(did)) == Some(actor)
+    }
+
     /// The actor the relay writes under for this member's MCP edits, made the
     /// first time they edit.
     pub async fn mcp_actor(&self, did: &Did) -> Result<ActorId> {
@@ -472,9 +479,10 @@ pub struct ActorsAsked {
 }
 
 /// `POST /v1/documents/{id}/actors` on the `notes.` host: the DID behind
-/// each actor ID the plugin found in a document it holds. Same token as
-/// `/v1/workspaces`. Every actor asked about is answered, with `"did": null`
-/// where the relay does not know it. A document the caller may not open is a
+/// each actor ID the plugin found in a document it holds, and their handle
+/// where it could be verified. Same token as `/v1/workspaces`. Every actor
+/// asked about is answered, with `"did": null` where the relay does not know
+/// it. A document the caller may not open is a
 /// `404`, the same as one that does not exist.
 pub async fn serve_document_actors(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
@@ -518,13 +526,18 @@ pub async fn serve_document_actors(
         .await
     {
         Ok(Some(answered)) => {
+            let handles = state
+                .handles
+                .handles_for(answered.iter().filter_map(|(_, did)| did.as_ref()))
+                .await;
             let actors: serde_json::Map<String, serde_json::Value> = answered
                 .into_iter()
                 .map(|(actor, did)| {
-                    (
-                        actor.to_hex_string(),
-                        serde_json::json!({ "did": did.map(|did| did.0) }),
-                    )
+                    let mut entry = serde_json::json!({ "did": did.as_ref().map(|did| &did.0) });
+                    if let Some(handle) = did.as_ref().and_then(|did| handles.get(did)) {
+                        entry["handle"] = serde_json::json!(handle);
+                    }
+                    (actor.to_hex_string(), entry)
                 })
                 .collect();
             axum::Json(serde_json::json!({ "actors": actors })).into_response()

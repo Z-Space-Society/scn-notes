@@ -19,6 +19,7 @@ use super::notes::{NoteError, Notes};
 use super::search;
 use crate::auth::Caller;
 use crate::authz::Authz;
+use crate::handles::Handles;
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 50;
@@ -28,6 +29,7 @@ const MAX_HISTORY_LIMIT: usize = 100;
 #[derive(Clone)]
 pub struct NotesServer {
     authz: Authz,
+    handles: Handles,
     tool_router: ToolRouter<Self>,
 }
 
@@ -144,9 +146,10 @@ fn caller(parts: &Parts) -> Result<Caller, ErrorData> {
 
 #[tool_router]
 impl NotesServer {
-    pub fn new(authz: Authz) -> Self {
+    pub fn new(authz: Authz, handles: Handles) -> Self {
         Self {
             authz,
+            handles,
             tool_router: Self::tool_router(),
         }
     }
@@ -204,8 +207,10 @@ impl NotesServer {
 
     #[tool(
         description = "A note's history. With no version: its changes, newest first, grouped \
-                       by session, each with the member's DID (or \"unknown\"), the device's \
-                       time, and characters added and removed. With version: the note's text \
+                       by session, each with the member's DID (or \"unknown\"), their handle \
+                       where it could be verified, \"you\" on your own changes, \"via\": \
+                       \"mcp\" on changes made through these tools, the device's time, and \
+                       characters added and removed. With version: the note's text \
                        as that change left it, removed text included. With version and \
                        compare_to: the text removed and added between them. Times are as each \
                        device's clock reported them. This never changes the note.",
@@ -234,22 +239,41 @@ impl NotesServer {
         };
         let time = |t: Option<chrono::DateTime<chrono::Utc>>| t.map(|t| t.to_rfc3339());
         match history.await {
-            Ok(History::Changes { groups, more }) => listed(json!({
-                "path": path,
-                "times": "as each device's clock reported them",
-                "groups": groups.iter().map(|group| json!({
-                    "id": group.id.to_string(),
-                    "did": self
-                        .authz
-                        .actor_owner(&group.actor)
-                        .map_or_else(|| "unknown".to_string(), |did| did.0),
-                    "device_time": { "from": time(group.from), "to": time(group.to) },
-                    "added": group.added,
-                    "removed": group.removed,
-                    "changes": group.changes,
-                })).collect::<Vec<_>>(),
-                "more": more,
-            })),
+            Ok(History::Changes { groups, more }) => {
+                let owners: Vec<_> = groups
+                    .iter()
+                    .map(|group| self.authz.actor_owner(&group.actor))
+                    .collect();
+                let handles = self.handles.handles_for(owners.iter().flatten()).await;
+                let listing = groups.iter().zip(&owners).map(|(group, owner)| {
+                    let mut entry = json!({
+                        "id": group.id.to_string(),
+                        "did": owner
+                            .as_ref()
+                            .map_or_else(|| "unknown".to_string(), |did| did.0.clone()),
+                        "device_time": { "from": time(group.from), "to": time(group.to) },
+                        "added": group.added,
+                        "removed": group.removed,
+                        "changes": group.changes,
+                    });
+                    if let Some(handle) = owner.as_ref().and_then(|did| handles.get(did)) {
+                        entry["handle"] = json!(handle);
+                    }
+                    if owner.as_ref() == Some(&caller.did) {
+                        entry["you"] = json!(true);
+                    }
+                    if self.authz.is_mcp_actor(&group.actor) {
+                        entry["via"] = json!("mcp");
+                    }
+                    entry
+                });
+                listed(json!({
+                    "path": path,
+                    "times": "as each device's clock reported them",
+                    "groups": listing.collect::<Vec<_>>(),
+                    "more": more,
+                }))
+            }
             Ok(History::Text(text)) => said(text),
             Ok(History::Diff(hunks)) => listed(json!(hunks
                 .iter()
