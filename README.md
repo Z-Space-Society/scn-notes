@@ -191,6 +191,17 @@ On the `notes.` listener (`PUBLIC_BIND`), everything a member's clients reach:
 - **The base URL and the audiences are never versioned.** The plugin adds the
   API version it was built for. Inside `/v1/` changes only add things; a
   breaking change is `/v2/`, served beside `/v1/`, never a change to `/v1/`.
+- **Browser apps get CORS at two levels, and only two.** The plugin's
+  resource document (`/.well-known/oauth-protected-resource`) sends
+  `Access-Control-Allow-Origin: *`: it is public and holds nothing about any
+  member. Everything under `/v1/` answers pages on loopback only
+  (`http://127.0.0.1`, `localhost` or `[::1]`, any port), naming the origin,
+  including the preflight. Any other origin gets no CORS headers, nothing
+  sends `Access-Control-Allow-Credentials`, and the host is compared as
+  written, so a name that merely resolves to 127.0.0.1 is refused. The
+  `/v1/sync` WebSocket does not check `Origin`: CORS does not cover a
+  WebSocket, and its only credential is the token in the query, which a page
+  on another origin does not have.
 - **`/` is left free**, for pages if the service ever has any.
 - **Nothing else answers here.** Any other path is a `404`, including the old
   host's `/` websocket and `/vaults`, and `/internal/` is not served on this

@@ -8,6 +8,7 @@ mod actors;
 mod auth;
 mod authz;
 mod config;
+mod cors;
 mod filter;
 mod handles;
 mod mcp;
@@ -344,13 +345,19 @@ fn router(state: AppState) -> Router {
 /// `/v1/`. `/` is left free. `/internal/` is not served here at all, so this
 /// listener can be routed whole.
 fn notes_router(state: AppState, mcp: Router) -> Router {
-    Router::new()
+    // Everything under `/v1/` answers a page on loopback, and nothing else
+    // here does; see `cors`. Layered on the group, so a later `/v1/` route
+    // gets the same rule without asking for it.
+    let v1 = Router::new()
         .route("/v1/sync", get(sync))
         .route("/v1/workspaces", get(workspaces::list_own))
         .route(
             "/v1/documents/{id}/actors",
             post(actors::serve_document_actors),
         )
+        .layer(axum::middleware::from_fn(cors::loopback_only));
+    Router::new()
+        .merge(v1)
         .route("/health", get(health))
         .route("/.well-known/oauth-protected-resource", get(sync_metadata))
         .with_state(state)
@@ -387,14 +394,16 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 ///
 /// The token goes in the query string on the websocket, where a browser or
 /// phone cannot set a header, and in the header on `/workspaces`.
+///
+/// Any origin may read it: a browser client finds Corliss here too, and the
+/// document holds nothing about any member.
 async fn sync_metadata(State(state): State<AppState>) -> Response {
     match &state.oidc_issuer {
-        Some(issuer) => Json(serde_json::json!({
+        Some(issuer) => cors::public_document(Json(serde_json::json!({
             "resource": &*state.audience,
             "authorization_servers": [&**issuer],
             "bearer_methods_supported": ["header", "query"],
-        }))
-        .into_response(),
+        }))),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -484,6 +493,7 @@ mod tests {
     use super::*;
 
     use auth::tests::{Issuer, TokenSpec, SYNC_AUDIENCE};
+    use axum::http::Method;
     use serde_json::{json, Value};
     use sqlx::PgPool;
 
@@ -1406,6 +1416,145 @@ mod tests {
             upgrade(&format!("{notes}/?access_token={token}")).await,
             StatusCode::NOT_FOUND
         );
+    }
+
+    const LOOPBACK_PAGE: &str = "http://127.0.0.1:5173";
+
+    /// Each `/v1/` request a browser client makes, with its preflight's method.
+    fn v1_requests(notes: &str) -> [(Method, String); 2] {
+        [
+            (Method::GET, format!("{notes}/v1/workspaces")),
+            (
+                Method::POST,
+                format!("{notes}/v1/documents/2Nh3ZUyHVYDyYCtZ3mgBuELcBAez/actors"),
+            ),
+        ]
+    }
+
+    async fn preflight(url: &str, origin: &str, method: &Method) -> reqwest::Response {
+        reqwest::Client::new()
+            .request(Method::OPTIONS, url)
+            .header("origin", origin)
+            .header("access-control-request-method", method.as_str())
+            .header(
+                "access-control-request-headers",
+                "authorization,content-type",
+            )
+            .send()
+            .await
+            .unwrap()
+    }
+
+    fn no_credentials(response: &reqwest::Response) {
+        assert!(!response
+            .headers()
+            .contains_key("access-control-allow-credentials"));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn v1_answers_no_other_origin(pool: PgPool) {
+        let relay = start(&pool).await;
+        let token = relay.notes_token(ALICE, &[]);
+        let client = reqwest::Client::new();
+        for origin in [
+            "https://evil.example",
+            "null",
+            "https://127.0.0.1:5173",
+            "http://127.0.0.1.evil.example",
+        ] {
+            for (method, url) in v1_requests(&relay.notes) {
+                let pre = preflight(&url, origin, &method).await;
+                assert_eq!(
+                    pre.status(),
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{origin} {url}"
+                );
+                assert!(
+                    !pre.headers()
+                        .keys()
+                        .any(|name| name.as_str().starts_with("access-control-")),
+                    "{origin} {url}"
+                );
+
+                let real = client
+                    .request(method, &url)
+                    .header("origin", origin)
+                    .bearer_auth(&token)
+                    .json(&json!({"actors": []}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(
+                    !real.headers().contains_key("access-control-allow-origin"),
+                    "{origin} {url}"
+                );
+            }
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn v1_answers_a_page_on_loopback(pool: PgPool) {
+        let relay = start(&pool).await;
+        for (method, url) in v1_requests(&relay.notes) {
+            let pre = preflight(&url, LOOPBACK_PAGE, &method).await;
+            assert_eq!(pre.status(), StatusCode::NO_CONTENT, "{url}");
+            let headers = pre.headers();
+            assert_eq!(headers["access-control-allow-origin"], LOOPBACK_PAGE);
+            let methods = headers["access-control-allow-methods"].to_str().unwrap();
+            assert!(methods.contains(method.as_str()), "{methods}");
+            let allowed = headers["access-control-allow-headers"]
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(allowed.contains("authorization"), "{allowed}");
+            assert!(allowed.contains("content-type"), "{allowed}");
+            assert!(headers.get_all("vary").iter().any(|v| v == "origin"));
+            no_credentials(&pre);
+        }
+
+        // The answer is readable, a refusal included, so the client can act on it.
+        let url = format!("{}/v1/workspaces", relay.notes);
+        for token in [Some(relay.notes_token(ALICE, &[])), None] {
+            let mut request = reqwest::Client::new()
+                .get(&url)
+                .header("origin", LOOPBACK_PAGE);
+            if let Some(token) = &token {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await.unwrap();
+            let expected = match token {
+                Some(_) => StatusCode::OK,
+                None => StatusCode::UNAUTHORIZED,
+            };
+            assert_eq!(response.status(), expected);
+            assert_eq!(
+                response.headers()["access-control-allow-origin"],
+                LOOPBACK_PAGE
+            );
+            assert!(response
+                .headers()
+                .get_all("vary")
+                .iter()
+                .any(|v| v == "origin"));
+            no_credentials(&response);
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn any_origin_may_read_the_resource_document(pool: PgPool) {
+        let relay = start(&pool).await;
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{}/.well-known/oauth-protected-resource",
+                relay.notes
+            ))
+            .header("origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+        no_credentials(&response);
     }
 
     #[sqlx::test(migrations = false)]
