@@ -590,6 +590,18 @@ and drops it when it passes.
 
 ## Releasing
 
+Before the version bump, check the lockfile against the RustSec advisory
+database, and run `cargo update` if it finds something a compatible version
+fixes (install once with `cargo install cargo-audit --locked`):
+
+```sh
+cargo audit
+```
+
+It must exit cleanly. An advisory that does not apply goes in
+`.cargo/audit.toml` with the reason beside it. "Unmaintained" warnings do not
+fail the run.
+
 Deployment checks out a release tag, so the tag has to reach the remote. Merge
 the version bump to `main`, then create the release on GitHub, which tags
 `main` there:

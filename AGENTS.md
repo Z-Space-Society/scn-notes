@@ -32,6 +32,7 @@ The toolchain is pinned in `rust-toolchain.toml` (1.98.0); `Cargo.toml` keeps
 cargo build --release
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
+cargo audit    # before a release; ignores live in .cargo/audit.toml with reasons
 ```
 
 Most tests need Postgres. `DATABASE_URL` is the server the test harness may

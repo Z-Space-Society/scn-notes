@@ -600,7 +600,7 @@ pub(crate) mod tests {
         let token = encode(
             &header,
             &TokenSpec::default().claims,
-            &EncodingKey::from_secret(b"not the issuer"),
+            &EncodingKey::from_secret(b"not the issuer").unwrap(),
         )
         .unwrap();
         let result = verifier.verify(Some(&token), SYNC_AUDIENCE).await;
