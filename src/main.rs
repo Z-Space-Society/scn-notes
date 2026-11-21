@@ -355,7 +355,7 @@ fn notes_router(state: AppState, mcp: Router) -> Router {
             "/v1/documents/{id}/actors",
             post(actors::serve_document_actors),
         )
-        .layer(axum::middleware::from_fn(cors::loopback_only));
+        .layer(axum::middleware::from_fn(cors::browser_clients));
     Router::new()
         .merge(v1)
         .route("/health", get(health))
