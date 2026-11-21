@@ -1,4 +1,4 @@
-//! CORS for browser clients on loopback (Corliss #69).
+//! CORS for browser clients (Corliss #69, #74).
 //!
 //! A browser app reads the relay cross-origin, and a browser refuses to hand
 //! it a response that does not name its origin. Two levels, and only two,
@@ -6,18 +6,20 @@
 //!
 //! - **The public resource document** is readable by any origin (`*`). It
 //!   holds no member data, and the request carries no credential.
-//! - **`/v1/`** answers loopback origins only (`127.0.0.1`, `localhost`,
-//!   `[::1]`, any port, plain `http`), by name, never `*`, including the
-//!   preflight. A public client's redirect can only land on loopback, so that
-//!   is the only origin a browser client of ours can be. Any other origin
-//!   gets no CORS headers at all, so the browser keeps the answer from it.
+//! - **`/v1/`** answers browser clients by name, never `*`, including the
+//!   preflight: loopback over `http` (`127.0.0.1`, `localhost`, `[::1]`, any
+//!   port) **or any well-formed `https` origin**. CORS is not the access
+//!   control here — the bearer token is — and a client may bring its own https
+//!   deployment rather than only a page on this machine. Any other origin gets
+//!   no CORS headers at all, so the browser keeps the answer from it.
 //!
 //! Nothing sends `Access-Control-Allow-Credentials`: the relay has no cookie,
 //! and a token travels in the header or the query where the page put it.
 //!
-//! The host is compared as written. A name that only resolves to 127.0.0.1
-//! (a DNS-rebound one) is refused, because the page behind it is not on
-//! this machine.
+//! A loopback host is compared as written. A name that only resolves to
+//! 127.0.0.1 (a DNS-rebound one) is refused, because the page behind it is not
+//! on this machine — and an `https` origin is a real origin whatever it
+//! resolves to.
 //!
 //! The `/v1/sync` WebSocket does not check `Origin`. A WebSocket is not
 //! covered by CORS, and its only credential is the token in the query, which
@@ -63,6 +65,70 @@ pub fn is_loopback_origin(origin: &str) -> bool {
     port_ok && matches!(host, "127.0.0.1" | "localhost" | "[::1]")
 }
 
+/// Whether a browser `Origin` header is one of our clients.
+///
+/// **Loopback over `http`, or any well-formed `https` origin.** CORS decides
+/// whether a page may read a response, not whether it may act: the bearer token
+/// does that, and the page had to obtain it from its own user. So the question
+/// here is "could this be a browser client of ours", and a client that serves
+/// its own client metadata document over https is exactly that — even though it
+/// is not on this machine.
+pub fn is_browser_origin(origin: &str) -> bool {
+    is_loopback_origin(origin) || is_https_origin(origin)
+}
+
+/// Whether this is a bare `https` origin: scheme, host, optional port, nothing
+/// else. A path, query, fragment or credentials mean it is not an origin.
+fn is_https_origin(origin: &str) -> bool {
+    let Some(authority) = origin.strip_prefix("https://") else {
+        return false;
+    };
+    if authority.is_empty()
+        || authority.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#' | '@' | '\\')
+        })
+    {
+        return false;
+    }
+
+    // An IPv6 (or IPvFuture) host is bracketed, so the colon that belongs to the
+    // host cannot be mistaken for the one before the port.
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((inside, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let is_address = !inside.is_empty()
+            && inside
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.'));
+        return is_address && valid_port(after);
+    }
+
+    let (host, port) = authority.split_at(authority.find(':').unwrap_or(authority.len()));
+    let is_hostname = !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    is_hostname && valid_port(port)
+}
+
+/// Nothing, or `:port` with a port a browser could be on.
+fn valid_port(rest: &str) -> bool {
+    match rest.strip_prefix(':') {
+        None => rest.is_empty(),
+        Some(digits) => {
+            !digits.is_empty()
+                && digits.len() <= 5
+                && digits.bytes().all(|b| b.is_ascii_digit())
+                && digits.parse::<u32>().is_ok_and(|n| n <= 65535)
+        }
+    }
+}
+
 /// Let any origin read a public document.
 pub fn public_document(response: impl IntoResponse) -> Response {
     let mut response = response.into_response();
@@ -73,15 +139,15 @@ pub fn public_document(response: impl IntoResponse) -> Response {
     response
 }
 
-/// Let a page on loopback call these routes, including the preflight.
+/// Let a browser client call these routes, including the preflight.
 ///
 /// Any other origin gets no CORS headers, and its preflight falls through to
 /// the router, which refuses the method.
-pub async fn loopback_only(request: Request, next: Next) -> Response {
+pub async fn browser_clients(request: Request, next: Next) -> Response {
     let origin = request
         .headers()
         .get(header::ORIGIN)
-        .filter(|value| value.to_str().is_ok_and(is_loopback_origin))
+        .filter(|value| value.to_str().is_ok_and(is_browser_origin))
         .cloned();
 
     let mut response = match &origin {
@@ -117,7 +183,7 @@ pub async fn loopback_only(request: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::is_loopback_origin;
+    use super::{is_browser_origin, is_loopback_origin};
 
     #[test]
     fn everything_but_loopback_is_refused() {
@@ -142,6 +208,52 @@ mod tests {
             "HTTP://127.0.0.1:5173",
         ] {
             assert!(!is_loopback_origin(origin), "{origin:?}");
+        }
+    }
+
+    #[test]
+    fn https_origins_are_browser_clients() {
+        for origin in [
+            "https://boris.tngl.io",
+            "https://example.test:8443",
+            "https://xn--bcher-kva.example",
+            "https://[2001:db8::1]:8443",
+        ] {
+            assert!(is_browser_origin(origin), "{origin:?}");
+        }
+    }
+
+    #[test]
+    fn loopback_is_a_browser_client() {
+        for origin in [
+            "http://127.0.0.1:5173",
+            "http://localhost",
+            "http://[::1]:3000",
+        ] {
+            assert!(is_browser_origin(origin), "{origin:?}");
+        }
+    }
+
+    #[test]
+    fn what_is_not_an_origin_is_refused() {
+        for origin in [
+            "",
+            "null",
+            "https://",
+            "https://example.test/",
+            "https://example.test/path",
+            "https://example.test?x",
+            "https://example.test#x",
+            "https://user@example.test",
+            "https://example.test:notaport",
+            "https://example.test:",
+            "https://example.test:65536",
+            "https://example..test",
+            "https://-lead.example",
+            "http://example.test:5173",
+            "HTTPS://example.test",
+        ] {
+            assert!(!is_browser_origin(origin), "{origin:?}");
         }
     }
 
