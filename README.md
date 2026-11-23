@@ -31,7 +31,7 @@ flowchart TB
     subgraph relay["scn-notes — one Rust binary"]
         direction TB
         subgraph listeners["Three listeners"]
-            notes_l["notes. :7032<br/>/v1/sync · /v1/workspaces<br/>/v1/documents/{id}/actors<br/>/mcp · /.well-known/*"]
+            notes_l["notes. :7032<br/>/v1/sync · /v1/workspaces<br/>/v1/documents/{id}/actors<br/>/v1/workspaces/{root}/attachments<br/>/mcp · /.well-known/*"]
             sync_l["sync. :7030 (legacy)<br/>/ · /sync websockets<br/>/vaults · /internal/*"]
             mcp_l["mcp. :7031 (legacy)<br/>MCP at its path"]
         end
@@ -113,6 +113,8 @@ What this does not do:
 
 - **It does not unshare the past.** A former member, of the network or of a
   group, keeps whatever their devices already hold.
+- **It does not delete attachments yet.** No route removes one, and stored
+  bytes stay until unreferenced cleanup ships.
 - **It is not live co-editing.** Members' edits merge as they sync, the same
   way one member's devices do. Two people rewriting one sentence at once get
   both sets of characters interleaved.
@@ -145,11 +147,15 @@ All settings come from the environment; systemd loads them from an
 | `SCN_NOTES_MCP_BIND` | `0.0.0.0:7031` | The MCP listener. |
 | `SCN_NOTES_PUBLIC_URL` | *required with auth* | The public URL of the `notes.` host: an origin with no path and no trailing slash, such as `https://notes.example.org`. A plugin's token there carries it as `aud`, and an MCP client's carries it with `/mcp` after it. The relay refuses to start on anything with a path or a trailing slash. |
 | `SCN_NOTES_PUBLIC_BIND` | `0.0.0.0:7032` | The `notes.` listener. |
+| `SCN_NOTES_ATTACHMENTS_ENABLED` | `false` | Serves the [attachment](#attachments) routes. Off, they are a `404` and any stored rows stay. |
+| `SCN_NOTES_ATTACHMENT_MAX_BYTES` | `52428800` (50 MiB) | Per file. `0` refuses every upload; downloads still work. |
+| `SCN_NOTES_ATTACHMENT_WORKSPACE_QUOTA_BYTES` | `2147483648` (2 GiB) | The sum of a workspace's attachment sizes. |
 | `SCN_NOTES_SERVICE_TOKEN` | *required with auth* | The shared credential Corliss presents on `/internal/`. |
 | `RUST_LOG` | `scn_notes=info,samod=info` | Standard `tracing` filter. |
 
 With auth on and any of the required settings missing or blank, the relay
-refuses to start and names the one it wants.
+refuses to start and names the one it wants. An attachment cap that is not a
+whole number of bytes refuses startup too.
 
 - **The audiences must match Corliss character for character.** A token
   whose `aud` differs by a trailing slash is refused, and the only symptom is
@@ -184,6 +190,8 @@ On the `notes.` listener (`PUBLIC_BIND`), everything a member's clients reach:
 | `GET /v1/sync` | plugin | WebSocket upgrade; the automerge-repo sync protocol. The token rides in the query, `?access_token=`, with `PUBLIC_URL` as its `aud`. |
 | `GET /v1/workspaces` | plugin | The caller's workspaces, as `{"workspaces", "root_folders"}`. Makes the Private workspace if they have none yet. `Authorization: Bearer` with the same token as `/v1/sync`. |
 | `POST /v1/documents/{id}/actors` | plugin | The member behind each actor in a document (see [Actors](#actors)). `Authorization: Bearer` with the same token as `/v1/sync`. |
+| `POST /v1/workspaces/{root_doc_id}/attachments` | plugin | Upload a file (see [Attachments](#attachments)). Same token as `/v1/sync`. Served only with `ATTACHMENTS_ENABLED`. |
+| `GET`, `HEAD /v1/workspaces/{root_doc_id}/attachments/{sha256}` | plugin | Download a file, or check it is there. Same token and flag. |
 | `GET /.well-known/oauth-protected-resource` | anyone | The plugin's resource: `resource` is `PUBLIC_URL`, `authorization_servers` is the issuer. A plugin given only the notes URL finds Corliss here. |
 | `GET /.well-known/oauth-protected-resource/mcp` | anyone | The MCP resource: `resource` is `PUBLIC_URL/mcp`. A refused MCP request points here. |
 | `GET /health` | anyone | Liveness, as on the sync listener. |
@@ -309,7 +317,9 @@ A workspace is one JSON object:
   "created_at": "<RFC 3339 timestamp>",
   "last_change_at": "<RFC 3339 timestamp, or null>",
   "note_count": "<integer, or null>",
-  "bytes": "<integer, or null>"
+  "bytes": "<integer, or null>",
+  "attachment_bytes": "<integer, or null>",
+  "attachment_count": "<integer, or null>"
 }
 ```
 
@@ -318,7 +328,9 @@ since it started, and `bytes` is filled in by the listing endpoints only:
 the MCP tools list workspaces on every call and do not pay for the query. It
 is the bytes the workspace's documents take in storage, which is their
 Automerge history. It grows with every edit and reads larger than the notes
-as files.
+as files. `attachment_bytes` and `attachment_count` are the workspace's
+attachments, the figure its quota checks, kept apart from `bytes`; they too
+are filled in by the listing endpoints only.
 
 Listings return `{"workspaces": [...], "root_folders": ["Private",
 "Workspaces"]}`, oldest first. `root_folders` names the folders workspaces sit
@@ -416,6 +428,51 @@ in no workspace.
 - **It refuses rather than guesses** when the workspace already has an entry
   with the folder's name.
 
+### Attachments
+
+Files and images in a workspace, stored in Postgres and addressed by their
+SHA-256 within the workspace. The design is
+[`docs/specs/0002-spec-attachment-storage`](docs/specs/0002-spec-attachment-storage/0002-spec-attachment-storage.md).
+A folder document names one with an entry whose `url` is
+`attachment:<sha256>`, written by the plugin after the upload; the bytes never
+travel over sync.
+
+An upload is `POST /v1/workspaces/{root_doc_id}/attachments` with the bytes
+as the body, `Content-Type`, and `X-Content-SHA256` as 64 lowercase hex
+characters. The answer is the metadata:
+
+```json
+{
+  "sha256": "<64 hex>",
+  "size": 184320,
+  "content_type": "image/png",
+  "workspace_root_doc_id": "<root document ID>",
+  "url": "attachment:<64 hex>",
+  "existing": false
+}
+```
+
+- **`201`** stored it; **`200`** with `"existing": true` means the workspace
+  already holds those bytes, and the body was not read. `HEAD` first to skip
+  sending a file that is there.
+- **Verified before it is stored.** The body is staged to a temporary file
+  while it is hashed, and only a body matching `X-Content-SHA256` is written,
+  row and chunks in one transaction. A mismatch is `422 hash_mismatch`, and a
+  failed or interrupted upload leaves nothing behind.
+- **Errors** are `{"error": "<code>"}`: `400` with `invalid_workspace`,
+  `invalid_sha256` or `missing_content_type`; `413` with `too_large` or
+  `quota_exceeded`; `422` with `hash_mismatch`. A workspace that does not
+  exist and one the caller may not open are the same bare `404`, as is a hash
+  the workspace does not hold.
+- **A download** is the whole file, with `Content-Type` as uploaded,
+  `Content-Length`, `Cache-Control: private, max-age=31536000, immutable`,
+  `X-Content-Type-Options: nosniff`, and
+  `Content-Security-Policy: default-src 'none'; sandbox`, so an uploaded SVG or
+  HTML file runs no script in a browser. There is no `Range` or conditional
+  request: clients compare hashes and keep whole files.
+- **Access is the workspace's row**, the same rule as the listing, not the
+  index, which is empty just after a restart.
+
 ### MCP tools
 
 Every tool acts as the member the token names, in the groups it names. A
@@ -511,6 +568,30 @@ CREATE TABLE actor_members (
   first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE relay_jobs (name TEXT PRIMARY KEY, done_at TIMESTAMPTZ NOT NULL DEFAULT now());
+
+CREATE TABLE attachments (
+  workspace_root_doc_id TEXT NOT NULL REFERENCES workspaces ON DELETE CASCADE,
+  sha256                BYTEA NOT NULL,
+  content_type          TEXT NOT NULL,
+  size                  BIGINT NOT NULL,
+  chunk_size            INT NOT NULL DEFAULT 1048576,
+  text_content          TEXT,
+  description           TEXT,
+  extractor             TEXT,
+  extracted_at          TIMESTAMPTZ,
+  created_by            TEXT NOT NULL,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  unreferenced_since    TIMESTAMPTZ,
+  PRIMARY KEY (workspace_root_doc_id, sha256)
+);
+CREATE TABLE attachment_chunks (
+  workspace_root_doc_id TEXT NOT NULL,
+  sha256                BYTEA NOT NULL,
+  chunk_no              INT NOT NULL,
+  data                  BYTEA NOT NULL,  -- STORAGE EXTERNAL
+  PRIMARY KEY (workspace_root_doc_id, sha256, chunk_no),
+  FOREIGN KEY (workspace_root_doc_id, sha256) REFERENCES attachments ON DELETE CASCADE
+);
 ```
 
 `storage` holds the documents. `workspaces` names each workspace's creator,
@@ -518,7 +599,10 @@ its group if it has one, and its root document. `doc_creators` records who
 first sent each document and the groups their token named then, and is what
 decides ownership: losing it loses every member's access to their own notes,
 so it is as much the store of record as `storage` is. `actor_members` maps
-each Automerge actor to its member.
+each Automerge actor to its member. `attachments` and `attachment_chunks`
+hold attachment bytes in 1 MiB chunks, uncompressed because images and PDFs
+already are. They are created whether or not attachments are enabled, and a
+backup of the database carries them like every other table.
 
 **From a relay before v0.7.0.** A database with a `vaults` table is first
 brought up to v0.6.0's shape by the statements older relays ran, then
