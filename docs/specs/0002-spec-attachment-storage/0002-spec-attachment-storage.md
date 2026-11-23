@@ -1,6 +1,6 @@
 # 0002 Spec: Attachment storage
 
-Status: Draft for review, 2026-11-10 (quill)
+Status: Draft for review, 2026-11-10 (quill); revised 2026-11-23 (Jacob)
 
 Decision record:
 [0001-postgres-for-attachments](../../decisions/0001-postgres-for-attachments.md)
@@ -27,14 +27,18 @@ replacement.
 
 - **Garage/S3.** The estate has an object store; v1 does not use it. See the
   decision record.
-- **End-to-end encryption.** The relay can read every attachment, as it can
-  every note. Postgres operators can too.
+- **Encryption at rest.** Attachments are not encrypted at rest, as notes are
+  not.
 - **OCR, PDF thumbnails, server-side rendering.** A PDF is bytes; text is a
   later extraction job.
 - **Global dedupe.** Dedupe is per workspace in v1. The same bytes in two
   workspaces are stored twice.
-- **Automatic deletion when a note is deleted.** The plugin's trash decision
-  decides; the relay keeps bytes until a later GC.
+- **A delete route.** Removing a file's folder entry is the delete. The relay
+  removes bytes that no folder entry in the workspace has named for the grace
+  period (see [Unreferenced bytes](#unreferenced-bytes)).
+- **Range requests and conditional GET.** The plugin writes whole files to disk
+  and Obsidian reads them there, and the plugin compares hashes, so it never
+  re-fetches bytes it holds.
 - **A public or signed URL.** Every byte route requires the member's token.
 - **Binary Automerge documents.** `.canvas` and `.base` are text-only in the
   plugin and are out of scope here.
@@ -72,6 +76,9 @@ update.
 | 2026-11-09 | "Vault" becomes "workspace"; the workspace ID is `root_doc_id TEXT`; member HTTP routes are under `/v1/` on the `notes.` host; MCP tools take one path. | Jacob | issue #11 update, scn-obsidian#27 |
 | 2026-11-10 | No surrogate `uuid` for an attachment. The identity is `(workspace_root_doc_id, sha256)`, which is the content address and the dedupe key. | quill | this spec |
 | 2026-11-10 | The folder entry carries `size` and `mime` as additive fields; the relay ignores them and the plugin uses them to decide whether to fetch eagerly. | quill | this spec |
+| 2026-11-23 | An upload is staged to a temporary file while it is hashed, then written in one transaction. A row exists only once its bytes are verified; there is no `pending` or `failed` state. | Jacob | this spec |
+| 2026-11-23 | No delete route. The relay removes bytes no folder entry has named for 30 days; `unreferenced_since` replaces `deleted_at`. | Jacob | this spec |
+| 2026-11-23 | No `Range`, `ETag` or `If-None-Match` in v1. | Jacob | this spec |
 
 ## Storage
 
@@ -86,14 +93,13 @@ CREATE TABLE attachments (
   content_type          TEXT NOT NULL,
   size                  BIGINT NOT NULL,
   chunk_size            INT NOT NULL DEFAULT 1048576,
-  status                TEXT NOT NULL DEFAULT 'pending',
   text_content          TEXT,
   description           TEXT,
   extractor             TEXT,
   extracted_at          TIMESTAMPTZ,
   created_by            TEXT NOT NULL,          -- DID
   created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
-  deleted_at            TIMESTAMPTZ,
+  unreferenced_since    TIMESTAMPTZ,
   PRIMARY KEY (workspace_root_doc_id, sha256),
   CONSTRAINT attachments_sha256_len
     CHECK (octet_length(sha256) = 32),
@@ -101,8 +107,6 @@ CREATE TABLE attachments (
     CHECK (size >= 0),
   CONSTRAINT attachments_chunk_size_positive
     CHECK (chunk_size > 0),
-  CONSTRAINT attachments_status_known
-    CHECK (status IN ('pending', 'complete', 'failed')),
   CONSTRAINT attachments_content_type_present
     CHECK (content_type <> '')
 );
@@ -110,9 +114,9 @@ CREATE TABLE attachments (
 CREATE INDEX attachments_workspace_created
   ON attachments (workspace_root_doc_id, created_at);
 
-CREATE INDEX attachments_deleted
-  ON attachments (deleted_at)
-  WHERE deleted_at IS NOT NULL;
+CREATE INDEX attachments_unreferenced
+  ON attachments (unreferenced_since)
+  WHERE unreferenced_since IS NOT NULL;
 
 CREATE TABLE attachment_chunks (
   workspace_root_doc_id TEXT NOT NULL,
@@ -136,7 +140,7 @@ ALTER TABLE attachment_chunks
   nobody outside the database needs. The URL uses the hex hash; the database uses
   `BYTEA` and `decode($1, 'hex')` at the boundary.
 - **1 MiB chunks.** Large enough to keep the row count and the per-row overhead
-  down, small enough that a range read touches one or two rows. `chunk_size` is
+  down, small enough that a download streams one row at a time. `chunk_size` is
   stored per attachment so a later change can be a new value, not a migration of
   old rows.
 - **`STORAGE EXTERNAL`.** Image and PDF bytes are already compressed. Letting
@@ -144,31 +148,32 @@ ALTER TABLE attachment_chunks
   TOAST still moves large values out of the main heap; this only turns off the
   compression attempt.
 - **Chunks are immutable.** No update path. A change to the file is a new hash,
-  a new row and a new folder entry. That is what makes a range read, a cache, a
-  trash window and a future version history tractable.
-- **Status.**
-  - `pending`: rows are being written; no download.
-  - `complete`: every chunk is present and the size matches; downloadable.
-  - `failed`: an upload was abandoned or mismatched; chunks are removed by GC.
-  A `pending` row older than the GC window is treated as abandoned.
+  a new row and a new folder entry. That is what makes a cache, a grace window
+  and a future version history tractable.
+- **A row means verified bytes.** The row and every chunk are inserted in one
+  transaction, after the upload's hash has been checked (see
+  [Upload](#upload)). There is no partial state: a row that exists is complete
+  and downloadable. Nothing a failed or abandoned upload did is ever visible.
 - **Dedupe.** `(workspace_root_doc_id, sha256)` is unique. An upload checks
-  for a complete row first and returns `200` with its metadata. If a row is
-  `pending`, an upload of the same hash may help finish it: chunks are inserted
-  with `ON CONFLICT DO NOTHING`, and whichever request finishes marks it
-  `complete`. If a row is `failed`, it is deleted first, chunks and all, and the
-  upload starts again.
-- **Quota.** The workspace's complete, not-deleted `size` values sum to its
-  attachment bytes. The sum is checked against a configurable quota before a new
-  row is created and again as the body streams. A race can overshoot by one
-  file; that is acceptable for v1 and is why the quota is a guardrail, not a
-  security boundary.
+  for the row first and returns `200` with its metadata. Two uploads of the same
+  hash that both get as far as the insert are settled by the primary key: the
+  second insert waits on the first transaction, finds the row, writes nothing
+  and returns `200`.
+- **Quota.** The workspace's `size` values sum to its attachment bytes. Every
+  row counts, including one in its grace window, so bytes uploaded and never
+  named in a folder cannot sidestep the quota. The sum is checked against a
+  configurable quota before the body is read and again before the insert. A
+  race can overshoot by one file; that is acceptable for v1 and is why the quota
+  is a guardrail, not a security boundary.
 - **No path column.** A path is a position in a folder document, not a property
   of the bytes. A rename or a move changes the entry only; the attachment row and
   its chunks do not move. The same hash can be linked from two folders in one
   workspace, and both entries show it.
-- **`deleted_at`.** Reserved for the trash decision. v1 has no HTTP delete
-  route. A row with `deleted_at` set is not downloadable and does not count
-  against the quota. A later GC removes its chunks after a grace period.
+- **`unreferenced_since`.** When the relay first saw that no folder entry in
+  the workspace names this hash, or null while one does. It is written by the
+  GC, never by a client. A row with it set is still downloadable, so a file
+  put back from Obsidian's trash or a folder's history within the grace period
+  still opens. See [Unreferenced bytes](#unreferenced-bytes).
 - **Text fields.** `text_content`, `description`, `extractor` and `extracted_at`
   are the contract with the search/extraction work in #12. v1 leaves them null;
   `get_attachment_text` reports that no text has been extracted yet.
@@ -180,8 +185,9 @@ listing endpoints through `add_sizes`) and `note_count`. Attachments are a secon
 kind of bytes. Add two fields, filled by the same `add_sizes` path so the MCP
 tools do not pay for the query:
 
-- `attachment_bytes: Option<i64>` — sum of complete, not-deleted `size`.
-- `attachment_count: Option<i64>` — count of complete, not-deleted rows.
+- `attachment_bytes: Option<i64>`: the sum of `size`, the figure the quota
+  checks.
+- `attachment_count: Option<i64>`: the number of rows.
 
 `bytes` stays exactly what it is today: the storage the workspace's Automerge
 documents take. Adding attachment bytes into it would make the figure mean two
@@ -193,9 +199,7 @@ A single query per listed workspace is enough:
 ```sql
 SELECT COALESCE(SUM(size), 0)::BIGINT, COUNT(*)::BIGINT
 FROM attachments
-WHERE workspace_root_doc_id = $1
-  AND status = 'complete'
-  AND deleted_at IS NULL;
+WHERE workspace_root_doc_id = $1;
 ```
 
 If the admin listing later needs the same figure, it uses the same query. It
@@ -247,6 +251,46 @@ folders and notes:
   delete it. The relay ignores it. This is additive to the folder shape and does
   not need a `/v2/`.
 
+## Unreferenced bytes
+
+There is no delete route. A file is deleted by removing its folder entry, which
+is what the plugin already does for a note. The relay removes the bytes once no
+entry in the workspace has named them for a grace period of 30 days.
+
+- **The walk collects hashes.** `src/reach.rs` already reads every entry of
+  every folder it admits. While it skips non-`folder`/`md` entries for
+  reachability, it also collects the hash from each `attachment:` URL into the
+  workspace's set of referenced attachments. The set is kept only from a
+  complete walk: every folder loaded and no link still waiting for its
+  creator. Any other walk keeps the previous set, and a workspace that has not
+  been walked since startup has none.
+- **Why the derived index may drive a delete.** The index is never authority
+  for access, and this does not make it so. It only sets a mark; a row is
+  removed only if no complete walk in 30 days found an entry naming it, and
+  the walk reads the folder documents themselves. One wrong walk costs
+  nothing, because the next complete walk that sees the entry clears the mark.
+- **The GC marks, then removes.** At startup and hourly, for each workspace
+  with a referenced set:
+  - set `unreferenced_since = now()` on rows whose hash is not in the set and
+    whose `unreferenced_since` is null;
+  - clear `unreferenced_since` on rows whose hash is in the set again;
+  - delete rows whose `unreferenced_since` is older than 30 days. Chunks
+    cascade.
+  A workspace without a referenced set is skipped, so a relay that has just
+  started, or a folder that will not load, never makes bytes look unreferenced.
+- **The grace period is the trash.** Obsidian's trash, an undo, or a folder
+  restored from history can put an entry back within 30 days, and the bytes are
+  still there. After that, an entry pointing at a removed hash is a `404`; a
+  plugin that still has the file uploads it again.
+- **It also cleans up after interruptions.** Bytes uploaded whose folder entry
+  was never written are unreferenced from the first pass and go after the
+  grace period.
+- **References are per workspace.** An entry in another workspace does not keep
+  a row alive, because a hash in another workspace is not readable from this
+  one. Moving a file between workspaces is an upload to the new one.
+- The grace period is a constant, like the chunk size. Rows in their grace
+  period count against the quota until they are removed.
+
 ## HTTP API
 
 Three routes on the `notes.` listener, beside `/v1/workspaces`:
@@ -255,7 +299,7 @@ Three routes on the `notes.` listener, beside `/v1/workspaces`:
 |---|---|
 | `POST /v1/workspaces/{root_doc_id}/attachments` | Stream a body, verify its hash, store the chunks, return metadata. |
 | `HEAD /v1/workspaces/{root_doc_id}/attachments/{sha256}` | Existence and dedupe check. |
-| `GET /v1/workspaces/{root_doc_id}/attachments/{sha256}` | Stream the bytes, with `Range` support. |
+| `GET /v1/workspaces/{root_doc_id}/attachments/{sha256}` | Stream the bytes. |
 
 `{root_doc_id}` is the workspace's root Automerge document ID from
 `GET /v1/workspaces`, never Corliss's group number and never a workspace name.
@@ -294,25 +338,28 @@ Content-Length: 184320
 - **Required headers.** `Content-Type` (stored; bounded to a sane length) and
   `X-Content-SHA256` (64 lowercase hex characters). A missing or malformed hash
   is `400 invalid_sha256`; a missing content type is `400 missing_content_type`.
-- **Stream, never buffer.** Read the body as a stream into a 1 MiB buffer. Hash
-  every byte as it arrives. Never hold the whole file in memory.
+- **Stage, then write.** Stream the body to a temporary file on the relay's
+  disk, hashing every byte as it arrives. Never hold the whole file in memory,
+  and hold no database connection while a slow client is still sending.
 - **Verify, never trust.** The header is a hint for the dedupe check. The server
-  hashes the streamed body and compares. A mismatch is `422 hash_mismatch`; the
-  row is left for GC or for another upload to complete, never marked complete.
-- **Dedupe.** If a complete row for `(workspace, hash)` exists, return `200` with
-  its metadata and do not read the body. The plugin should `HEAD` first for
-  large files; a client that goes straight to `POST` must tolerate an early
-  response.
-- **Pending races.** If a `pending` row exists, this request may write the
-  missing chunks and mark it complete. Chunk inserts are
-  `ON CONFLICT DO NOTHING`, so two uploads of the same hash are idempotent.
+  compares the hash of what it staged. A mismatch is `422 hash_mismatch`; the
+  temporary file is removed and nothing reaches the database.
+- **One transaction.** Once the hash matches, insert the row and every chunk,
+  read back from the temporary file in 1 MiB pieces, in one short transaction,
+  then remove the file. An interrupted upload, a mismatch or a crash leaves no
+  row and no chunks; a stale temporary file is removed at startup.
+- **Dedupe.** If the row for `(workspace, hash)` exists, return `200` with its
+  metadata and do not read the body. The plugin should `HEAD` first for large
+  files; a client that goes straight to `POST` must tolerate an early response.
+  Two uploads of the same hash at once both stage; the second insert finds the
+  first's row and returns `200`.
 - **Size.** `Content-Length`, when present, is checked against the per-file cap
   before reading. When absent, the handler counts and stops at the cap. A body
   over the cap is `413 too_large`.
-- **Quota.** After dedupe and before creating a new row, sum the workspace's
-  complete rows. If adding this file would exceed the workspace quota, return
-  `413 quota_exceeded`. The check is repeated as the body grows so a missing
-  `Content-Length` cannot overshoot by a whole file.
+- **Quota.** After dedupe, and again before the insert, sum the workspace's
+  rows. If adding this file would exceed the workspace quota, return
+  `413 quota_exceeded`. The staging step stops at the per-file cap, so a
+  missing `Content-Length` cannot stage more than one file's worth.
 - **Response.**
   - `201 Created` when this request stored the bytes.
   - `200 OK` when the hash was already complete.
@@ -333,8 +380,9 @@ Content-Length: 184320
     decide anything; it is there so a log or a test can tell the two apart.
 - **No filename in the request.** The name is the folder entry's `name`. The
   upload route stores bytes and metadata; the plugin writes the entry after the
-  upload succeeds. If the entry write fails, the bytes are orphaned until GC;
-  that is cheaper than a two-phase commit across HTTP and Automerge.
+  upload succeeds. If the entry write fails, the bytes are unreferenced and go
+  after the grace period; that is cheaper than a two-phase commit across HTTP
+  and Automerge.
 
 ### Download
 
@@ -343,28 +391,22 @@ GET /v1/workspaces/{root_doc_id}/attachments/{sha256}
 Authorization: Bearer <token>
 ```
 
-- **Only complete, not-deleted rows.** A pending, failed or deleted row is
-  `404`, as is a workspace the caller cannot open.
+- **Any row.** A hash with no row is `404`, as is a workspace the caller
+  cannot open. A row in its grace period is served.
 - **Headers.**
   - `Content-Type` from the row.
   - `Content-Length` from the row.
-  - `Accept-Ranges: bytes`.
-  - `ETag: "<sha256>"`, quoted.
-  - `Cache-Control: private, max-age=31536000, immutable` — the bytes behind a
-    hash never change.
+  - `Cache-Control: private, max-age=31536000, immutable`, because the bytes
+    behind a hash never change.
   - `X-Content-Type-Options: nosniff`.
   - `Content-Security-Policy: default-src 'none'; sandbox` — an uploaded SVG or
     HTML file must not run script if a browser opens the URL.
-- **Conditional GET.** `If-None-Match` matching the ETag is `304 Not Modified`,
-  with no body.
-- **Range.** A single `Range: bytes=start-end` (or `start-` or `-suffix`) is
-  `206 Partial Content` with `Content-Range: bytes start-end/total` and a
-  `Content-Length` of the slice. The handler reads only the chunks the range
-  touches and slices the first and last. Multiple ranges are `416` in v1; the
-  plugin asks for one at a time.
-- **Range bounds.** A range outside the file is `416` with
-  `Content-Range: bytes */<size>`. A zero-length file is a `200` with
-  `Content-Length: 0`; a range on it is `416`.
+- **No `Range` or conditional GET.** A `Range` header is ignored and the whole
+  file is sent with `200`; `If-None-Match` is ignored. The plugin writes whole
+  files to disk, Obsidian's viewers read the local file, and the plugin never
+  fetches a hash it already holds. Either is additive later if a client needs
+  it.
+- **Zero-length file.** A `200` with `Content-Length: 0`.
 - **Streaming.** The body is a stream of chunk rows in order, not a `Vec` of the
   whole file. A 50 MiB file must not become 50 MiB of heap per download.
 - **No `Content-Disposition`.** The row has no filename; the plugin knows the
@@ -375,8 +417,7 @@ Authorization: Bearer <token>
 
 `HEAD` on the download path returns the same status and headers as `GET`, with
 no body. It is the plugin's cheap duplicate check before an upload: `200` means
-the bytes are already there and complete; `404` means upload. `409` is not used
-here; a pending row is `404` until it is complete.
+the bytes are already there; `404` means upload.
 
 ### Errors
 
@@ -389,10 +430,9 @@ codes:
 | 400 | `invalid_sha256` | The hash is not 64 lowercase hex characters. |
 | 400 | `missing_content_type` | No `Content-Type` on an upload. |
 | 401 | — | No token, or a token for another audience. |
-| 404 | — | Workspace not open, attachment not found, pending or deleted. |
+| 404 | — | Workspace not open, or attachment not found. |
 | 413 | `too_large` | Over the per-file cap. |
 | 413 | `quota_exceeded` | Over the workspace quota. |
-| 416 | `invalid_range` | A multi-range or out-of-bounds request. |
 | 422 | `hash_mismatch` | The streamed bytes do not match `X-Content-SHA256`. |
 | 500 | `internal` | A storage failure. The reason is logged, not returned. |
 
@@ -415,8 +455,8 @@ Takes one path, the same path the folder entry has:
   entry whatever its `type`. The existing duplicate-name rule applies.
 - The entry's `url` must start with `attachment:` and the hash must be valid.
   An `md` entry is not an attachment; a folder is not a file.
-- Load the attachment row by `(located.root, hash)`. If it is missing, pending,
-  failed or deleted, return a tool error that says so, not a 500.
+- Load the attachment row by `(located.root, hash)`. If it is missing, return
+  a tool error that says so, not a 500.
 - **Images up to the MCP image cap** (`SCN_NOTES_MCP_IMAGE_MAX_BYTES`, proposed
   4 MiB) are returned as MCP `image` content: base64 data and the stored
   `mimeType`. This is what lets an agent see a diagram without a second
@@ -466,27 +506,32 @@ tool's JSON, but it changes what a client thinks a "note" is.
 
 ## Ops
 
-- **Backups and WAL.** Base backups and WAL now grow with attachment bytes. A
-  workspace with a 2 GiB quota is 2 GiB in every base backup and in WAL until the
-  next base backup. Before enabling uploads in production, measure the current
-  base-backup window and the WAL volume for the largest workspace; if the window
+- **Backups.** The cluster's Postgres backup is a daily, cluster-wide
+  `pg_dumpall` streamed into restic. A dump writes `bytea` as hex text, about
+  twice the stored size, and dumps every byte on every run; restic's
+  deduplication keeps the repository's growth near the change, but the dump's
+  duration and transfer grow with the total. Before enabling uploads in
+  production, measure the current dump's duration and size and project them
+  with the proposed quota across the expected workspaces; if the daily window
   does not fit, lower the quota or move to an object store. This is the cost the
   ADR accepted.
+- **WAL.** Each upload writes its bytes to WAL once. There is no WAL archiving
+  in the backup tier, so this is disk churn on the Postgres host, not backup
+  size.
 - **TOAST and bloat.** Chunks are 1 MiB values, so Postgres TOASTs them into the
   toast table. `SET STORAGE EXTERNAL` turns off compression, not TOAST. Deleted
   chunks leave dead tuples; autovacuum handles them, and `pg_repack` or a
   partition swap is the escape hatch if a large delete leaves a table bloated.
   Partitioning `attachment_chunks` by workspace or month is the later move
   suggested in the issue; v1 does not do it.
-- **GC.** A background task at startup and hourly:
-  - `pending` rows older than 24 hours: delete, chunks cascade.
-  - `failed` rows older than 24 hours: delete.
-  - `deleted_at` older than the trash grace (when delete exists): delete.
-  The task uses the existing `Authz` pool and logs a count, not file names.
+- **GC.** The background task in [Unreferenced bytes](#unreferenced-bytes),
+  at startup and hourly. It also removes temporary upload files left by a
+  crash. It uses the existing `Authz` pool and logs counts, not file names.
 - **Metrics to watch.** Database and toast table size
   (`pg_total_relation_size('attachments')`,
-  `pg_total_relation_size('attachment_chunks')`), WAL generation, base-backup
-  duration, upload/download latency, 413/422 counts, and GC deletions.
+  `pg_total_relation_size('attachment_chunks')`), WAL generation, `pg_dumpall`
+  duration, upload/download latency, 413/422 counts, and rows marked and
+  removed by the GC.
 - **The admin listing** gets `attachment_bytes` and `attachment_count` with the
   workspaces, never text or bytes. It runs one aggregate per workspace, like the
   existing `bytes` query. The same "counts and sizes, never titles or text" rule
@@ -500,13 +545,17 @@ tool's JSON, but it changes what a client thinks a "note" is.
 | Variable | Default | Notes |
 |---|---|---|
 | `SCN_NOTES_ATTACHMENT_MAX_BYTES` | `52428800` (50 MiB) | Per file. `0` disables uploads, not reads. Proposed; confirm in review. |
-| `SCN_NOTES_ATTACHMENT_WORKSPACE_QUOTA_BYTES` | `2147483648` (2 GiB) | Sum of complete, not-deleted rows per workspace. Proposed; confirm in review. |
+| `SCN_NOTES_ATTACHMENT_WORKSPACE_QUOTA_BYTES` | `2147483648` (2 GiB) | Sum of every row per workspace, including rows in their grace period. Proposed; confirm in review. |
 | `SCN_NOTES_MCP_IMAGE_MAX_BYTES` | `4194304` (4 MiB) | Larger images become a resource link. |
 | `SCN_NOTES_ATTACHMENTS_ENABLED` | `false` | Serves the routes only when true. Lets the schema ship before the plugin. |
 
 The chunk size is a constant, not a setting: 1 MiB. A deployment that needs a
 different value changes the constant and the default in the same PR; old rows
-carry their own `chunk_size`.
+carry their own `chunk_size`. The grace period for unreferenced bytes is a
+constant too: 30 days.
+
+Temporary upload files go in the system temporary directory. At most one
+per-file cap per upload in flight is staged there.
 
 The proposed caps are deliberately conservative for the first deployment. They
 are guardrails, not product decisions; the review should set the real numbers
@@ -522,9 +571,9 @@ after measuring the backup window.
 | `src/config.rs` | The four settings above. |
 | `src/main.rs` | The three routes on `notes_router`; the GC task in `open_relay`/`main`. |
 | `src/mcp/tools.rs` | Tool registration and descriptions. |
-| `src/reach.rs` | No change: it already ignores non-`folder`/`md` entries. |
+| `src/reach.rs` | The walk also collects `attachment:` hashes into each workspace's referenced set, kept only from a walk that loaded every folder. Reachability is unchanged: these entries are still not walked, listed or admitted. |
 
-The store and the handlers in one file keep the chunk format and the range
+The store and the handlers in one file keep the chunk format and the streaming
 logic together; the file will be large, and a `src/attachments/` directory is
 the split if it grows past that.
 
@@ -532,13 +581,15 @@ the split if it grows past that.
 
 Unit tests:
 
-- **Store.** A pending row becomes complete; a chunk boundary at exactly
-  1 MiB and at 1 MiB + 1; a zero-byte file; a hash mismatch leaves nothing
-  complete; dedupe returns the existing row; a failed row is replaced; quota
-  counts only complete, not-deleted rows; the GC removes pending and failed rows
-  and leaves complete ones.
-- **Range.** First chunk only, last chunk only, a range spanning three chunks, a
-  suffix range, an out-of-bounds range, a zero-length file, `If-None-Match`.
+- **Store.** A chunk boundary at exactly 1 MiB and at 1 MiB + 1; a zero-byte
+  file; a hash mismatch leaves no row, no chunks and no temporary file; an
+  upload cut off mid-body leaves the same; dedupe returns the existing row;
+  quota counts rows in their grace period.
+- **GC.** A hash named by no entry is marked; a marked hash named again is
+  cleared; a hash marked 31 days ago is removed with its chunks; a workspace
+  whose last walk missed a folder or left a link pending, or that has not been
+  walked, is not touched;
+  a hash named only in another workspace is marked here.
 - **Path resolver.** An attachment under a nested folder; a name collision
   resolves to the lowest URL; a note path is not an attachment; a folder is not
   an attachment; an `attachment:` URL with a bad hash is refused.
@@ -551,8 +602,8 @@ Integration tests, with the `Relay` helper and `#[sqlx::test]`:
   `HEAD` it, cannot upload to it. Alice in group 7 uploads to group 7's
   workspace; Bob in group 7 reads it; Bob with a token that does not name 7 gets
   `404`. A service token is not a member token and is refused.
-- **Round trip.** Upload a 3 MiB image, read it byte for byte, `HEAD` it,
-  `Range` the middle, `If-None-Match` it. The folder entry the plugin writes is
+- **Round trip.** Upload a 3 MiB image, read it byte for byte, `HEAD` it.
+  The folder entry the plugin writes is
   visible in the folder document but absent from `note_count` and from
   `search_notes`.
 - **Dedupe.** A second upload of the same bytes returns `200`, `existing: true`,
@@ -561,10 +612,13 @@ Integration tests, with the `Relay` helper and `#[sqlx::test]`:
 - **Limits.** A body over the per-file cap is `413 too_large`; a file over the
   workspace quota is `413 quota_exceeded`; a hash mismatch is `422`.
 - **Restart.** Upload, restart the app on the same database, download the same
-  bytes. A pending row is cleaned by the GC after its window.
+  bytes. A GC pass right after restart, before the walk, marks nothing.
+- **Unreferenced.** Upload and link a file, remove the entry, run the GC: the
+  row is marked and still downloadable; put the entry back and it is cleared.
 - **MCP.** `read_attachment` on an image returns image content under the cap and
   a resource link over it; `get_attachment_text` reports "not extracted" before
-  extraction; a path in another workspace is refused; a deleted row is refused.
+  extraction; a path in another workspace is refused; an entry whose row has
+  been removed is a tool error, not a 500.
 - **Compatibility.** A folder with an attachment entry is listed by
   `list_notes` without the attachment, and the reach index does not count it as
   a note. A note and an attachment must not both claim one name.
@@ -573,8 +627,10 @@ Acceptance checks that need a real client (deployed, not in this repo's tests):
 
 - Obsidian on desktop and iOS uploads a pasted image, sees it on the other
   device, renames it, and re-downloads it after a cache eviction.
-- The PDF viewer opens a PDF through the plugin's local file, including a range
-  read on iOS.
+- The PDF viewer opens a PDF through the plugin's local file, on desktop and
+  iOS.
+- Deleting an embedded image in Obsidian and restoring it from the trash the
+  same day brings it back on the other device.
 - Claude (web, desktop, Code) can call `read_attachment` on an image and
   `get_attachment_text` on a PDF.
 
@@ -603,7 +659,7 @@ routes `404`.
 ## Open questions
 
 1. **Per-file cap and workspace quota.** Proposed 50 MiB / 2 GiB. Decide after
-   measuring the base-backup window; the values are config, so the decision is
+   measuring the daily `pg_dumpall`; the values are config, so the decision is
    cheap to change.
 2. **Extraction inline or queued.** Inline on upload blocks the request and
    couples the attachment route to a PDF parser; a queued worker needs service
@@ -612,41 +668,38 @@ routes `404`.
 3. **Thumbnails.** Server-side generation (the `image` crate) is CPU and a new
    dependency; the plugin can downscale locally. Recommendation: defer, and let
    the plugin render the image it fetched.
-4. **Trash and `deleted_at`.** Does the relay own a grace window, or does the
-   plugin decide and tell the relay to delete? Recommendation: the plugin's
-   trash decides; the relay keeps bytes until a GC grace after `deleted_at`.
-   Decide with the trash feature, not here.
-5. **Should `list_notes` include attachments?** Adding them is additive to the
+4. **Should `list_notes` include attachments?** Adding them is additive to the
    JSON but changes what a client thinks a note is. Recommendation: no in v1;
    the plugin's tree and a known path are enough. Revisit if agents need to
    discover files.
-6. **Resource links for PDFs.** A link to the authenticated HTTP URL is not
+5. **Resource links for PDFs.** A link to the authenticated HTTP URL is not
    usable by an MCP client that has only the MCP token. Options: an MCP
    `resources/read` over `attachment:<sha256>`, a short-lived signed URL, or
    accept the limitation and point at `get_attachment_text`. Recommendation:
    accept the limitation in v1; add `resources/read` if a client needs bytes.
-7. **Content-type safety.** Should SVG, HTML and other active types be refused
+6. **Content-type safety.** Should SVG, HTML and other active types be refused
    at upload, or stored with `Content-Security-Policy: sandbox` and `nosniff`?
    Recommendation: store them with the headers, and add a deny list only if a
    browser path exposes them.
-8. **Per-member accounting.** Attachments count against a workspace quota. Does
+7. **Per-member accounting.** Attachments count against a workspace quota. Does
    a member's total (the #1 storage figure) include the workspaces they are in,
    or only the ones they created? Recommendation: per workspace in v1; member
    accounting is a separate figure.
-9. **`.canvas` and `.base`.** They are text files with their own semantics. They
+8. **`.canvas` and `.base`.** They are text files with their own semantics. They
    are not attachments in v1; the plugin keeps them text-only.
-10. **Global dedupe.** The same bytes in two workspaces are stored twice. This
+9. **Global dedupe.** The same bytes in two workspaces are stored twice. This
     is deliberate for accounting. Revisit only if storage, not permission,
     becomes the constraint.
 
 ## What this does not do
 
 - **It does not unshare the past.** A member who leaves a group keeps whatever
-  their devices already downloaded. The relay's bytes remain until a delete.
-- **It is not end-to-end encrypted.** The relay can read every attachment, as it
-  can every note. Postgres operators can too.
+  their devices already downloaded. The relay's bytes remain while a folder
+  entry names them.
+- **It is not encrypted at rest.** Attachments are stored as notes are.
 - **It does not make a note's attachment atomic with the note.** The plugin
   writes bytes first, then the folder entry. An interruption leaves unreferenced
-  bytes, which the GC removes; it does not corrupt a note.
+  bytes, which the GC removes after the grace period; it does not corrupt a
+  note.
 - **It does not hide text in images.** An image's description is extracted text
   or a caption, not a guarantee that the image has no other content.
