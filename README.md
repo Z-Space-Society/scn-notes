@@ -194,11 +194,14 @@ On the `notes.` listener (`PUBLIC_BIND`), everything a member's clients reach:
 - **Browser apps get CORS at two levels, and only two.** The plugin's
   resource document (`/.well-known/oauth-protected-resource`) sends
   `Access-Control-Allow-Origin: *`: it is public and holds nothing about any
-  member. Everything under `/v1/` answers pages on loopback only
-  (`http://127.0.0.1`, `localhost` or `[::1]`, any port), naming the origin,
-  including the preflight. Any other origin gets no CORS headers, nothing
-  sends `Access-Control-Allow-Credentials`, and the host is compared as
-  written, so a name that merely resolves to 127.0.0.1 is refused. The
+  member. Everything under `/v1/` answers a page on loopback
+  (`http://127.0.0.1`, `localhost` or `[::1]`, any port) or on any `https`
+  origin, naming the origin, including the preflight. The bearer token is the
+  access control, not CORS: a member's app may be hosted anywhere. Any other
+  origin (plain `http` elsewhere, `null`, anything with a path) gets no CORS
+  headers, nothing sends `Access-Control-Allow-Credentials`, and a loopback
+  host is compared as written, so a name that merely resolves to 127.0.0.1 is
+  refused. The
   `/v1/sync` WebSocket does not check `Origin`: CORS does not cover a
   WebSocket, and its only credential is the token in the query, which a page
   on another origin does not have.

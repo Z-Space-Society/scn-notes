@@ -60,7 +60,7 @@ cold-builds this repository on the target's glibc.
 | `src/reach.rs` | Walks folder documents from each workspace root; derived, in-memory, rebuildable. |
 | `src/filter.rs` | The transport filter: per-frame allow/deny on sync, and close at token expiry. |
 | `src/wire.rs` | Minimal CBOR envelope reader for the sync protocol. |
-| `src/cors.rs` | CORS: `*` on the public resource document, loopback origins only on `/v1/`. |
+| `src/cors.rs` | CORS: `*` on the public resource document; loopback over `http` or any `https` origin, by name, on `/v1/`. |
 | `src/workspaces.rs` | `/vaults`, `/internal/vaults*`, `/v1/workspaces`, `/internal/workspaces*`. |
 | `src/actors.rs` | Maps Automerge actors to members; owns the actor-history backfill. |
 | `src/handles.rs` | DID → verified handle for history and the actors endpoint; in-memory cache, the relay's only outbound identity lookups. |
@@ -98,10 +98,13 @@ bug, even if the tests pass.
   character for character. `PUBLIC_URL` must be an origin with no path and no
   trailing slash; the plugin's audience is that origin, MCP's is the origin
   plus `/mcp`. A mismatch surfaces only as `401`.
-- **CORS is `*` on the public resource document and loopback-only on
-  `/v1/`, and nowhere else.** Never `*` on anything that answers per member,
-  never `Access-Control-Allow-Credentials`, and the loopback host is compared
-  as written so a DNS-rebound name is refused. `/v1/sync` does not check
+- **CORS is `*` on the public resource document and browser clients on
+  `/v1/` (loopback over `http`, or any `https` origin, named back), and
+  nowhere else.** CORS is not the access control: the bearer token is. That
+  holds only while nothing under `/v1/` accepts an ambient credential, so
+  never a cookie, never trust by source address, never `*` on anything that
+  answers per member, and never `Access-Control-Allow-Credentials`. The
+  loopback host is compared as written so a DNS-rebound name is refused. `/v1/sync` does not check
   `Origin` on purpose: its token is in the query, not ambient. See `cors.rs`.
 - **Never log a token or a query string.** A browser or phone WebSocket cannot
   set `Authorization`, so sync tokens ride in `?access_token=` and the proxy

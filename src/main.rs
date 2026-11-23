@@ -345,7 +345,7 @@ fn router(state: AppState) -> Router {
 /// `/v1/`. `/` is left free. `/internal/` is not served here at all, so this
 /// listener can be routed whole.
 fn notes_router(state: AppState, mcp: Router) -> Router {
-    // Everything under `/v1/` answers a page on loopback, and nothing else
+    // Everything under `/v1/` answers a browser client, and nothing else
     // here does; see `cors`. Layered on the group, so a later `/v1/` route
     // gets the same rule without asking for it.
     let v1 = Router::new()
@@ -355,7 +355,7 @@ fn notes_router(state: AppState, mcp: Router) -> Router {
             "/v1/documents/{id}/actors",
             post(actors::serve_document_actors),
         )
-        .layer(axum::middleware::from_fn(cors::loopback_only));
+        .layer(axum::middleware::from_fn(cors::browser_clients));
     Router::new()
         .merge(v1)
         .route("/health", get(health))
