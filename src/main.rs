@@ -1510,9 +1510,9 @@ mod tests {
         let token = relay.notes_token(ALICE, &[]);
         let client = reqwest::Client::new();
         for origin in [
-            "https://evil.example",
+            "http://evil.example",
             "null",
-            "https://127.0.0.1:5173",
+            "https://evil.example/app",
             "http://127.0.0.1.evil.example",
         ] {
             for (method, url) in v1_requests(&relay.notes) {
