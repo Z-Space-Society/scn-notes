@@ -43,7 +43,23 @@ pub struct Config {
     /// Address the public listener binds: the `notes.` host, where members'
     /// clients reach everything. Not started with auth off.
     pub public_bind: String,
+
+    /// The attachment routes and their caps. `None` when attachments are off,
+    /// the default, so the schema can ship before any client uses it.
+    pub attachments: Option<AttachmentConfig>,
 }
+
+pub struct AttachmentConfig {
+    /// Per file. `0` refuses every upload; downloads still work.
+    pub max_bytes: u64,
+    /// The sum of a workspace's attachment sizes.
+    pub quota_bytes: u64,
+}
+
+/// 50 MiB. Conservative until the backup window is measured.
+const DEFAULT_ATTACHMENT_MAX_BYTES: u64 = 50 * 1024 * 1024;
+/// 2 GiB. Conservative until the backup window is measured.
+const DEFAULT_ATTACHMENT_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 pub struct AuthConfig {
     /// The `iss` every token must carry: the issuer's public URL.
@@ -119,8 +135,48 @@ impl Config {
             service_token,
             mcp_bind: var("MCP_BIND").unwrap_or_else(|_| "0.0.0.0:7031".to_string()),
             public_bind: var("PUBLIC_BIND").unwrap_or_else(|_| "0.0.0.0:7032".to_string()),
+            attachments: attachments(
+                var("ATTACHMENTS_ENABLED").ok().as_deref(),
+                var("ATTACHMENT_MAX_BYTES").ok().as_deref(),
+                var("ATTACHMENT_WORKSPACE_QUOTA_BYTES").ok().as_deref(),
+            )?,
         })
     }
+}
+
+/// The attachment settings, from their raw values. Only an explicit "on"
+/// enables the routes. A cap that is not a whole number of bytes, a negative
+/// one included, refuses startup rather than falling back to a default.
+fn attachments(
+    enabled: Option<&str>,
+    max_bytes: Option<&str>,
+    quota_bytes: Option<&str>,
+) -> Result<Option<AttachmentConfig>> {
+    let enabled = enabled
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"));
+    if !enabled {
+        return Ok(None);
+    }
+    let bytes = |name: &str, value: Option<&str>, default: u64| -> Result<u64> {
+        match value.map(str::trim).filter(|v| !v.is_empty()) {
+            None => Ok(default),
+            Some(v) => v.parse().with_context(|| {
+                format!("{PREFIX}{name} must be a whole number of bytes; got {v:?}")
+            }),
+        }
+    };
+    Ok(Some(AttachmentConfig {
+        max_bytes: bytes(
+            "ATTACHMENT_MAX_BYTES",
+            max_bytes,
+            DEFAULT_ATTACHMENT_MAX_BYTES,
+        )?,
+        quota_bytes: bytes(
+            "ATTACHMENT_WORKSPACE_QUOTA_BYTES",
+            quota_bytes,
+            DEFAULT_ATTACHMENT_QUOTA_BYTES,
+        )?,
+    }))
 }
 
 /// A setting the gated relay cannot run without. Blank counts as missing: an
@@ -162,7 +218,35 @@ fn var(name: &str) -> Result<String, std::env::VarError> {
 
 #[cfg(test)]
 mod tests {
-    use super::origin;
+    use super::{attachments, origin};
+
+    #[test]
+    fn attachments_are_off_unless_turned_on() {
+        for off in [None, Some(""), Some("false"), Some("0"), Some("maybe")] {
+            assert!(attachments(off, None, None).unwrap().is_none(), "{off:?}");
+        }
+        let on = attachments(Some("true"), None, None).unwrap().unwrap();
+        assert_eq!(on.max_bytes, 52_428_800);
+        assert_eq!(on.quota_bytes, 2_147_483_648);
+        let zero = attachments(Some("1"), Some("0"), Some("10"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((zero.max_bytes, zero.quota_bytes), (0, 10));
+    }
+
+    #[test]
+    fn an_attachment_cap_that_is_not_a_byte_count_refuses_startup() {
+        for bad in ["-1", "1.5", "50MiB"] {
+            assert!(
+                attachments(Some("true"), Some(bad), None).is_err(),
+                "{bad:?}"
+            );
+            assert!(
+                attachments(Some("true"), None, Some(bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn the_public_url_is_an_origin_alone() {

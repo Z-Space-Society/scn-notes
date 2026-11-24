@@ -5,6 +5,7 @@
 //! websocket upgrade; see `auth.rs` and [`build_verifier`].
 
 mod actors;
+mod attachments;
 mod auth;
 mod authz;
 mod config;
@@ -23,6 +24,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
+    extract::DefaultBodyLimit,
     extract::{
         ws::{WebSocket, WebSocketUpgrade},
         Query, State,
@@ -36,6 +38,7 @@ use samod::{AcceptorHandle, Repo, ShareConfig};
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
 
+use attachments::Attachments;
 use auth::{AllowAll, CorlissVerifier, DidVerifier, Verified};
 use authz::Authz;
 use config::Config;
@@ -61,6 +64,9 @@ struct AppState {
     service_token: Option<Arc<str>>,
     /// Members' verified handles, shown beside their DIDs.
     handles: Handles,
+    /// The attachment store. `None` when attachments are off, and then the
+    /// `notes.` listener does not serve their routes at all.
+    attachments: Option<Attachments>,
 }
 
 #[tokio::main]
@@ -84,6 +90,20 @@ async fn main() -> Result<()> {
     let verifier = build_verifier(&config).await?;
     let (repo, authz) = open_relay(&config).await?;
     authz.start_actor_backfill();
+    let attachments = match &config.attachments {
+        Some(settings) => Some(
+            Attachments::open(
+                authz.pool().clone(),
+                attachments::Limits {
+                    max_bytes: settings.max_bytes,
+                    quota_bytes: settings.quota_bytes,
+                },
+                std::env::temp_dir().join("scn-notes-uploads"),
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let handles = Handles::new(Arc::new(AtprotoResolver::new()?));
 
     // The URL is used only to identify this endpoint in samod's own logs; it
@@ -113,6 +133,7 @@ async fn main() -> Result<()> {
         enforce: config.require_auth,
         service_token: config.service_token.as_deref().map(Arc::from),
         handles: handles.clone(),
+        attachments,
     };
     let app = router(state.clone());
 
@@ -348,14 +369,29 @@ fn notes_router(state: AppState, mcp: Router) -> Router {
     // Everything under `/v1/` answers a browser client, and nothing else
     // here does; see `cors`. Layered on the group, so a later `/v1/` route
     // gets the same rule without asking for it.
-    let v1 = Router::new()
+    let mut v1 = Router::new()
         .route("/v1/sync", get(sync))
         .route("/v1/workspaces", get(workspaces::list_own))
         .route(
             "/v1/documents/{id}/actors",
             post(actors::serve_document_actors),
-        )
-        .layer(axum::middleware::from_fn(cors::browser_clients));
+        );
+    // Served only when attachments are on, so turning them off is a `404`
+    // and the rows stay where they are. The upload handler streams its body
+    // and enforces the per-file cap itself, so axum's buffered-body limit is
+    // lifted there.
+    if state.attachments.is_some() {
+        v1 = v1
+            .route(
+                "/v1/workspaces/{root_doc_id}/attachments",
+                post(attachments::upload).layer(DefaultBodyLimit::disable()),
+            )
+            .route(
+                "/v1/workspaces/{root_doc_id}/attachments/{sha256}",
+                get(attachments::download),
+            );
+    }
+    let v1 = v1.layer(axum::middleware::from_fn(cors::browser_clients));
     Router::new()
         .merge(v1)
         .route("/health", get(health))
@@ -513,10 +549,18 @@ mod tests {
         notes: String,
         authz: Authz,
         repo: Repo,
+        /// Where attachment uploads are staged, when attachments are on.
+        staging: Option<std::path::PathBuf>,
     }
 
     /// Start a relay. Calling it twice on one pool is a restart.
     async fn start(pool: &PgPool) -> Relay {
+        start_with(pool, None).await
+    }
+
+    /// Start a relay, with attachments on under these caps when given.
+    async fn start_with(pool: &PgPool, limits: Option<attachments::Limits>) -> Relay {
+        let staging = limits.map(|_| attachments::tests::staging_dir());
         let issuer = Issuer::start().await;
         let verifier: Arc<dyn DidVerifier> = Arc::new(issuer.verifier().await);
         let (authz, repo) = authz::tests::open(pool).await;
@@ -536,6 +580,14 @@ mod tests {
             enforce: true,
             service_token: Some(SERVICE_TOKEN.into()),
             handles: handles.clone(),
+            attachments: match (limits, &staging) {
+                (Some(limits), Some(staging)) => Some(
+                    Attachments::open(pool.clone(), limits, staging.clone())
+                        .await
+                        .unwrap(),
+                ),
+                _ => None,
+            },
         };
         let app = router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -578,6 +630,7 @@ mod tests {
             notes,
             authz,
             repo,
+            staging,
         }
     }
 
@@ -2429,5 +2482,491 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("the device's edit never reached MCP");
+    }
+
+    /// The attachment routes on the `notes.` host; spec 0002, HTTP API.
+    mod attachment_routes {
+        use super::*;
+
+        use attachments::{Limits, CHUNK_SIZE};
+        use sha2::{Digest, Sha256};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const GENEROUS: Limits = Limits {
+            max_bytes: 16 * 1024 * 1024,
+            quota_bytes: 64 * 1024 * 1024,
+        };
+
+        fn sha(bytes: &[u8]) -> String {
+            hex::encode(Sha256::digest(bytes))
+        }
+
+        /// Bytes that differ from chunk to chunk, so a misordered or repeated
+        /// chunk cannot read back equal.
+        fn bytes_of(len: usize) -> Vec<u8> {
+            (0..len)
+                .map(|i| (i % 251) as u8 ^ (i / CHUNK_SIZE) as u8)
+                .collect()
+        }
+
+        impl Relay {
+            fn attachments_url(&self, root: &str) -> String {
+                format!("{}/v1/workspaces/{root}/attachments", self.notes)
+            }
+
+            async fn upload(&self, token: &str, root: &str, bytes: &[u8]) -> reqwest::Response {
+                self.upload_as(token, root, bytes, &sha(bytes)).await
+            }
+
+            async fn upload_as(
+                &self,
+                token: &str,
+                root: &str,
+                bytes: &[u8],
+                claimed: &str,
+            ) -> reqwest::Response {
+                reqwest::Client::new()
+                    .post(self.attachments_url(root))
+                    .bearer_auth(token)
+                    .header("content-type", "image/png")
+                    .header("x-content-sha256", claimed)
+                    .body(bytes.to_vec())
+                    .send()
+                    .await
+                    .unwrap()
+            }
+
+            async fn fetch(
+                &self,
+                method: Method,
+                token: &str,
+                root: &str,
+                hash: &str,
+            ) -> reqwest::Response {
+                reqwest::Client::new()
+                    .request(method, format!("{}/{hash}", self.attachments_url(root)))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap()
+            }
+
+            /// The private workspace's root, made for the member now.
+            async fn private_root(&self, did: &str) -> String {
+                self.authz
+                    .private_workspace(&auth::Did(did.into()))
+                    .await
+                    .unwrap()
+                    .root_doc_id
+            }
+
+            /// `(attachment_bytes, attachment_count)` from the member's listing.
+            async fn attachment_figures(&self, token: &str, root: &str) -> (i64, i64) {
+                let listing: Value = reqwest::Client::new()
+                    .get(format!("{}/v1/workspaces", self.notes))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let workspace = listing["workspaces"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|w| w["root_doc_id"] == root)
+                    .unwrap()
+                    .clone();
+                (
+                    workspace["attachment_bytes"].as_i64().unwrap(),
+                    workspace["attachment_count"].as_i64().unwrap(),
+                )
+            }
+
+            /// Nothing is left staged once requests finish.
+            async fn assert_nothing_staged(&self) {
+                let staging = self.staging.clone().unwrap();
+                authz::tests::eventually("staged uploads are removed", || {
+                    std::fs::read_dir(&staging).unwrap().next().is_none()
+                })
+                .await;
+            }
+
+            /// Send raw HTTP, for bodies reqwest will not send: one cut short,
+            /// or chunked with no length. Returns the status, or `None` if the
+            /// relay closed without answering.
+            async fn raw_upload(
+                &self,
+                token: &str,
+                root: &str,
+                head: &str,
+                body: &[u8],
+            ) -> Option<u16> {
+                let addr = self.notes.trim_start_matches("http://");
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let request = format!(
+                    "POST /v1/workspaces/{root}/attachments HTTP/1.1\r\nhost: {addr}\r\n\
+                     authorization: Bearer {token}\r\ncontent-type: image/png\r\n{head}\r\n"
+                );
+                stream.write_all(request.as_bytes()).await.unwrap();
+                let _ = stream.write_all(body).await;
+                let _ = stream.shutdown().await;
+                let mut answer = Vec::new();
+                let _ = stream.read_to_end(&mut answer).await;
+                let answer = String::from_utf8_lossy(&answer);
+                answer
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|code| code.parse().ok())
+            }
+        }
+
+        #[sqlx::test(migrations = false)]
+        async fn a_file_round_trips_byte_for_byte_across_chunk_boundaries(pool: PgPool) {
+            let relay = start_with(&pool, Some(GENEROUS)).await;
+            let root = relay.private_root(ALICE).await;
+            let token = relay.notes_token(ALICE, &[]);
+
+            for len in [0, 1, CHUNK_SIZE, CHUNK_SIZE + 1, 3 * CHUNK_SIZE + 17] {
+                let bytes = bytes_of(len);
+                let hash = sha(&bytes);
+                let response = relay.upload(&token, &root, &bytes).await;
+                assert_eq!(response.status(), StatusCode::CREATED, "{len}");
+                let body: Value = response.json().await.unwrap();
+                assert_eq!(body["sha256"], hash.as_str());
+                assert_eq!(body["size"], len);
+                assert_eq!(body["url"], format!("attachment:{hash}"));
+                assert_eq!(body["existing"], false);
+
+                let response = relay.fetch(Method::GET, &token, &root, &hash).await;
+                assert_eq!(response.status(), StatusCode::OK, "{len}");
+                let headers = response.headers().clone();
+                assert_eq!(headers["content-type"], "image/png");
+                assert_eq!(headers["x-content-type-options"], "nosniff");
+                assert!(headers["cache-control"]
+                    .to_str()
+                    .unwrap()
+                    .contains("immutable"));
+                assert!(headers["content-security-policy"]
+                    .to_str()
+                    .unwrap()
+                    .contains("sandbox"));
+                assert_eq!(
+                    response.bytes().await.unwrap().as_ref(),
+                    bytes.as_slice(),
+                    "{len}"
+                );
+
+                let response = relay.fetch(Method::HEAD, &token, &root, &hash).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response.headers()["content-length"],
+                    len.to_string().as_str()
+                );
+            }
+            relay.assert_nothing_staged().await;
+        }
+
+        #[sqlx::test(migrations = false)]
+        async fn the_same_bytes_are_stored_once(pool: PgPool) {
+            let relay = start_with(&pool, Some(GENEROUS)).await;
+            let root = relay.private_root(ALICE).await;
+            let token = relay.notes_token(ALICE, &[]);
+            let bytes = bytes_of(CHUNK_SIZE + 5);
+
+            assert_eq!(
+                relay.upload(&token, &root, &bytes).await.status(),
+                StatusCode::CREATED
+            );
+            let again = relay.upload(&token, &root, &bytes).await;
+            assert_eq!(again.status(), StatusCode::OK);
+            assert_eq!(again.json::<Value>().await.unwrap()["existing"], true);
+            assert_eq!(
+                relay.attachment_figures(&token, &root).await,
+                (bytes.len() as i64, 1)
+            );
+
+            // Two at once: both succeed, one row.
+            let other = bytes_of(2 * CHUNK_SIZE + 9);
+            let (a, b) = tokio::join!(
+                relay.upload(&token, &root, &other),
+                relay.upload(&token, &root, &other)
+            );
+            let mut statuses = [a.status(), b.status()];
+            statuses.sort();
+            assert_eq!(statuses, [StatusCode::OK, StatusCode::CREATED]);
+            assert_eq!(
+                relay.attachment_figures(&token, &root).await,
+                ((bytes.len() + other.len()) as i64, 2)
+            );
+            let fetched = relay.fetch(Method::GET, &token, &root, &sha(&other)).await;
+            assert_eq!(fetched.bytes().await.unwrap().as_ref(), other.as_slice());
+        }
+
+        #[sqlx::test(migrations = false)]
+        async fn only_the_workspaces_holder_reaches_its_attachments(pool: PgPool) {
+            let relay = start_with(&pool, Some(GENEROUS)).await;
+            let alice = relay.notes_token(ALICE, &[]);
+            let bob = relay.notes_token(BOB, &[]);
+            let root = relay.private_root(ALICE).await;
+            let bytes = bytes_of(100);
+            let hash = sha(&bytes);
+            assert_eq!(
+                relay.upload(&alice, &root, &bytes).await.status(),
+                StatusCode::CREATED
+            );
+
+            // Bob cannot read, check or add to Alice's Private workspace, and
+            // cannot tell it from one that does not exist.
+            for method in [Method::GET, Method::HEAD] {
+                assert_eq!(
+                    relay.fetch(method, &bob, &root, &hash).await.status(),
+                    StatusCode::NOT_FOUND
+                );
+            }
+            assert_eq!(
+                relay.upload(&bob, &root, &bytes_of(7)).await.status(),
+                StatusCode::NOT_FOUND
+            );
+            let nowhere = wire::tests::doc_id(9).to_string();
+            assert_eq!(
+                relay
+                    .fetch(Method::GET, &alice, &nowhere, &hash)
+                    .await
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+
+            // No token, a service token, and a token for another audience are
+            // not a member.
+            for token in [
+                String::new(),
+                SERVICE_TOKEN.to_string(),
+                TokenSpec::default().claim("sub", json!(ALICE)).sign(),
+            ] {
+                assert_eq!(
+                    relay
+                        .fetch(Method::GET, &token, &root, &hash)
+                        .await
+                        .status(),
+                    StatusCode::UNAUTHORIZED
+                );
+            }
+
+            // A group's workspace opens to a token naming the group.
+            let garden = relay
+                .authz
+                .group_workspace(&auth::Did(ALICE.into()), "7", "Garden")
+                .await
+                .unwrap()
+                .root_doc_id;
+            let alice7 = relay.notes_token(ALICE, &["7"]);
+            assert_eq!(
+                relay.upload(&alice7, &garden, &bytes).await.status(),
+                StatusCode::CREATED
+            );
+            let bob7 = relay.notes_token(BOB, &["7"]);
+            let fetched = relay.fetch(Method::GET, &bob7, &garden, &hash).await;
+            assert_eq!(fetched.bytes().await.unwrap().as_ref(), bytes.as_slice());
+            assert_eq!(
+                relay
+                    .fetch(Method::GET, &bob, &garden, &hash)
+                    .await
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+
+        #[sqlx::test(migrations = false)]
+        async fn a_bad_upload_leaves_nothing_behind(pool: PgPool) {
+            let relay = start_with(
+                &pool,
+                Some(Limits {
+                    max_bytes: 3 * CHUNK_SIZE as u64,
+                    quota_bytes: 4 * CHUNK_SIZE as u64,
+                }),
+            )
+            .await;
+            let root = relay.private_root(ALICE).await;
+            let token = relay.notes_token(ALICE, &[]);
+
+            // The bytes do not match the hash claimed.
+            let bytes = bytes_of(2 * CHUNK_SIZE);
+            let wrong = sha(b"something else");
+            let response = relay.upload_as(&token, &root, &bytes, &wrong).await;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"],
+                "hash_mismatch"
+            );
+            assert_eq!(
+                relay
+                    .fetch(Method::GET, &token, &root, &wrong)
+                    .await
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+
+            // Over the per-file cap, declared and undeclared.
+            let big = bytes_of(3 * CHUNK_SIZE + 1);
+            let response = relay.upload(&token, &root, &big).await;
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"],
+                "too_large"
+            );
+            let mut chunked = Vec::new();
+            for piece in big.chunks(64 * 1024) {
+                chunked.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+                chunked.extend_from_slice(piece);
+                chunked.extend_from_slice(b"\r\n");
+            }
+            chunked.extend_from_slice(b"0\r\n\r\n");
+            let head = format!(
+                "x-content-sha256: {}\r\ntransfer-encoding: chunked\r\n",
+                sha(&big)
+            );
+            assert_eq!(
+                relay.raw_upload(&token, &root, &head, &chunked).await,
+                Some(413)
+            );
+
+            // A body cut off before its declared length.
+            let cut = bytes_of(CHUNK_SIZE + 3);
+            let head = format!(
+                "x-content-sha256: {}\r\ncontent-length: {}\r\n",
+                sha(&cut),
+                cut.len()
+            );
+            let status = relay
+                .raw_upload(&token, &root, &head, &cut[..CHUNK_SIZE / 2])
+                .await;
+            assert_ne!(status, Some(201));
+
+            // Over the workspace quota: 3 MiB stored, then 2 MiB more.
+            let first = bytes_of(3 * CHUNK_SIZE);
+            assert_eq!(
+                relay.upload(&token, &root, &first).await.status(),
+                StatusCode::CREATED
+            );
+            let response = relay
+                .upload(&token, &root, &bytes_of(2 * CHUNK_SIZE + 1))
+                .await;
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"],
+                "quota_exceeded"
+            );
+
+            // Only the one good upload is stored.
+            assert_eq!(
+                relay.attachment_figures(&token, &root).await,
+                (first.len() as i64, 1)
+            );
+            relay.assert_nothing_staged().await;
+        }
+
+        #[sqlx::test(migrations = false)]
+        async fn a_malformed_upload_is_refused_with_a_code(pool: PgPool) {
+            let relay = start_with(&pool, Some(GENEROUS)).await;
+            let root = relay.private_root(ALICE).await;
+            let token = relay.notes_token(ALICE, &[]);
+            let bytes = bytes_of(10);
+
+            let response = relay
+                .upload_as(&token, &root, &bytes, &sha(&bytes).to_uppercase())
+                .await;
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"],
+                "invalid_sha256"
+            );
+            let response = reqwest::Client::new()
+                .post(relay.attachments_url(&root))
+                .bearer_auth(&token)
+                .header("x-content-sha256", sha(&bytes))
+                .body(bytes.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"],
+                "missing_content_type"
+            );
+            let response = relay.upload(&token, "not-a-document", &bytes).await;
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"],
+                "invalid_workspace"
+            );
+            let response = relay.fetch(Method::GET, &token, &root, "abc").await;
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"],
+                "invalid_sha256"
+            );
+        }
+
+        #[sqlx::test(migrations = false)]
+        async fn a_zero_cap_refuses_uploads_but_not_downloads(pool: PgPool) {
+            let relay = start_with(&pool, Some(GENEROUS)).await;
+            let root = relay.private_root(ALICE).await;
+            let token = relay.notes_token(ALICE, &[]);
+            let bytes = bytes_of(10);
+            assert_eq!(
+                relay.upload(&token, &root, &bytes).await.status(),
+                StatusCode::CREATED
+            );
+
+            let relay = start_with(
+                &pool,
+                Some(Limits {
+                    max_bytes: 0,
+                    ..GENEROUS
+                }),
+            )
+            .await;
+            let token = relay.notes_token(ALICE, &[]);
+            let response = relay.upload(&token, &root, &bytes_of(11)).await;
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let fetched = relay.fetch(Method::GET, &token, &root, &sha(&bytes)).await;
+            assert_eq!(fetched.bytes().await.unwrap().as_ref(), bytes.as_slice());
+        }
+
+        #[sqlx::test(migrations = false)]
+        async fn attachments_survive_a_restart_and_vanish_with_the_flag(pool: PgPool) {
+            let relay = start_with(&pool, Some(GENEROUS)).await;
+            let root = relay.private_root(ALICE).await;
+            let token = relay.notes_token(ALICE, &[]);
+            let bytes = bytes_of(CHUNK_SIZE * 2);
+            let hash = sha(&bytes);
+            assert_eq!(
+                relay.upload(&token, &root, &bytes).await.status(),
+                StatusCode::CREATED
+            );
+
+            let relay = start_with(&pool, Some(GENEROUS)).await;
+            let token = relay.notes_token(ALICE, &[]);
+            let fetched = relay.fetch(Method::GET, &token, &root, &hash).await;
+            assert_eq!(fetched.bytes().await.unwrap().as_ref(), bytes.as_slice());
+
+            // Off: the routes are not served, and the rows stay.
+            let relay = start(&pool).await;
+            let token = relay.notes_token(ALICE, &[]);
+            assert_eq!(
+                relay
+                    .fetch(Method::GET, &token, &root, &hash)
+                    .await
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                relay.upload(&token, &root, &bytes_of(3)).await.status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                relay.attachment_figures(&token, &root).await,
+                (bytes.len() as i64, 1)
+            );
+        }
     }
 }

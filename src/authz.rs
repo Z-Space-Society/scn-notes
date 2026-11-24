@@ -134,6 +134,13 @@ pub struct Workspace {
     /// the size of the notes as files. Filled by [`Authz::add_sizes`] only,
     /// so the MCP tools, which list workspaces on every call, never pay for it.
     pub bytes: Option<i64>,
+    /// The bytes the workspace's attachments take, the figure its quota
+    /// checks. Kept apart from `bytes`, which stays Automerge history alone.
+    /// Filled by [`Authz::add_sizes`] only.
+    pub attachment_bytes: Option<i64>,
+    /// How many attachments the workspace holds. Filled with
+    /// `attachment_bytes`.
+    pub attachment_count: Option<i64>,
 }
 
 /// A workspace with the DID that made it, for the admin listing only.
@@ -178,6 +185,8 @@ fn workspace_from(row: &sqlx::postgres::PgRow, reach: &reach::Index) -> Result<W
         created_at: row.try_get("created_at")?,
         last_change_at: in_memory.or(row.try_get("last_change_at")?),
         bytes: None,
+        attachment_bytes: None,
+        attachment_count: None,
     })
 }
 
@@ -423,12 +432,24 @@ impl Authz {
         Ok(Some(unfiled))
     }
 
-    /// Fill in `bytes` for workspaces that have been walked.
+    /// Fill in the attachment figures, and `bytes` for workspaces that have
+    /// been walked.
     pub async fn add_sizes(
         &self,
         workspaces: impl IntoIterator<Item = &mut Workspace>,
     ) -> Result<()> {
         for workspace in workspaces {
+            // Counts and sizes only: never text, descriptions or bytes.
+            let (attachment_bytes, attachment_count): (i64, i64) = sqlx::query_as(
+                "SELECT COALESCE(SUM(size), 0)::BIGINT, COUNT(*)::BIGINT
+                 FROM attachments WHERE workspace_root_doc_id = $1",
+            )
+            .bind(&workspace.root_doc_id)
+            .fetch_one(&self.0.pool)
+            .await?;
+            workspace.attachment_bytes = Some(attachment_bytes);
+            workspace.attachment_count = Some(attachment_count);
+
             let docs = DocumentId::from_str(&workspace.root_doc_id)
                 .ok()
                 .and_then(|root| self.0.reach.read().unwrap().docs_of(&root));
@@ -453,6 +474,25 @@ impl Authz {
         .bind(docs)
         .fetch_one(&self.0.pool)
         .await?)
+    }
+
+    /// The relay's Postgres pool, for stores that sit beside the records.
+    pub fn pool(&self) -> &PgPool {
+        &self.0.pool
+    }
+
+    /// Who holds a workspace, from its row. `None` for a root that is no
+    /// workspace's.
+    ///
+    /// The row, not the reachability index: the index is derived, and empty
+    /// for every workspace just after startup.
+    pub async fn holder_of_workspace(&self, root: &DocumentId) -> Result<Option<Holder>> {
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT owner_did, group_id FROM workspaces WHERE root_doc_id = $1")
+                .bind(root.to_string())
+                .fetch_optional(&self.0.pool)
+                .await?;
+        Ok(row.map(|(owner, group)| Holder::of(Did(owner), group)))
     }
 
     /// The member's private workspace, made now if they have none. A member has
@@ -622,6 +662,7 @@ async fn migrate(pool: &PgPool) -> Result<(), sqlx::Error> {
     ] {
         sqlx::query(statement).execute(pool).await?;
     }
+    crate::attachments::migrate(pool).await?;
     Ok(())
 }
 

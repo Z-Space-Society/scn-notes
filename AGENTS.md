@@ -67,6 +67,7 @@ cold-builds this repository on the target's glibc.
 | `src/mcp/` | MCP listener (`mod.rs`), tools (`tools.rs`), note/folder document I/O (`notes.rs`), search (`search.rs`), history (`history.rs`). |
 | `src/unfiled.rs` | The `file-unfiled` command: orphans, recovery folder, deletion. |
 | `src/storage.rs` | samod `Storage` over one Postgres key/value table. |
+| `src/attachments.rs` | Attachment bytes: chunked tables, verified uploads staged to a temp file, the `notes.` routes (spec 0002). |
 
 ## Invariants
 
@@ -171,8 +172,9 @@ bug, even if the tests pass.
 | vault | The pre-v0.7.0 name. It survives only in the legacy endpoints and in cluster/deployment names. |
 
 Tables: `storage` (samod documents), `workspaces` (root, owner, optional group,
-name), `doc_creators` (creator DID and the groups its token named), and
-`actor_members` (Automerge actor → member). `relay_jobs` records one-off jobs
+name), `doc_creators` (creator DID and the groups its token named),
+`actor_members` (Automerge actor → member), and `attachments` /
+`attachment_chunks` (attachment bytes per workspace and SHA-256). `relay_jobs` records one-off jobs
 such as the actor backfill.
 
 A document schema is settled in the spec: folder documents are

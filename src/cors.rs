@@ -33,9 +33,10 @@ use axum::{
 };
 
 /// The methods `/v1/` uses. A preflight names one of them.
-const METHODS: &str = "GET, POST";
-/// `Authorization` for the member's token, `Content-Type` for a JSON body.
-const HEADERS: &str = "Authorization, Content-Type";
+const METHODS: &str = "GET, HEAD, POST";
+/// `Authorization` for the member's token, `Content-Type` for a JSON body or an
+/// attachment, `X-Content-SHA256` for an attachment upload.
+const HEADERS: &str = "Authorization, Content-Type, X-Content-SHA256";
 
 /// Whether a browser `Origin` header names a page on this machine.
 ///
